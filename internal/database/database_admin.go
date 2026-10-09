@@ -18,14 +18,16 @@ import (
 
 // DatabaseStatus describes the currently active database engine and runtime metrics.
 type DatabaseStatus struct {
-	Type         string           `json:"type"`
-	DSN          string           `json:"dsn,omitempty"`
-	DBPath       string           `json:"db_path,omitempty"`
-	OpenConns    int              `json:"open_conns"`
-	InUse        int              `json:"in_use"`
-	Idle         int              `json:"idle"`
-	MaxOpenConns int              `json:"max_open_conns"`
-	TableCounts  map[string]int64 `json:"table_counts"`
+	Type                 string           `json:"type"`
+	DSN                  string           `json:"dsn,omitempty"`
+	DBPath               string           `json:"db_path,omitempty"`
+	OpenConns            int              `json:"open_conns"`
+	InUse                int              `json:"in_use"`
+	Idle                 int              `json:"idle"`
+	MaxOpenConns         int              `json:"max_open_conns"`
+	GlobalWaitCount      int64            `json:"global_wait_count"`
+	GlobalWaitDurationMS int64            `json:"global_wait_duration_ms"`
+	TableCounts          map[string]int64 `json:"table_counts"`
 }
 
 // PostgresTestResult returns latency and version info after testing connection.
@@ -71,6 +73,8 @@ func InspectDatabaseStatus(db *gorm.DB, cfg *config.Config) *DatabaseStatus {
 			st.InUse = stats.InUse
 			st.Idle = stats.Idle
 			st.MaxOpenConns = stats.MaxOpenConnections
+			st.GlobalWaitCount = stats.WaitCount
+			st.GlobalWaitDurationMS = stats.WaitDuration.Milliseconds()
 		}
 
 		// Count rows for major model tables

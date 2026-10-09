@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/truewhile/MeBox/internal/config"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // FFprobeService wraps the external ffprobe binary.
@@ -101,6 +102,8 @@ type ProbeResult struct {
 // Probe runs ffprobe against path and returns a typed result. A 30s timeout
 // is applied so a single broken file does not hang the scanner.
 func (f *FFprobeService) Probe(ctx context.Context, path string) (*ProbeResult, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "ffprobe.probe", started)
 	if f == nil {
 		return nil, errors.New("ffprobe service nil")
 	}
@@ -121,10 +124,13 @@ func (f *FFprobeService) Probe(ctx context.Context, path string) (*ProbeResult, 
 			"-show_streams",
 			path,
 		)
+		execStarted := perftrace.Begin(ctx)
 		out, err := cmd.Output()
+		perftrace.End(ctx, "ffprobe.execute", execStarted)
 		if err == nil {
 			return parseProbeJSON(out)
 		}
+		perftrace.Count(ctx, "ffprobe.execute.error")
 		if f.log != nil {
 			f.log.Debug("ffprobe failed, trying ffmpeg fallback", zap.String("path", path), zap.Error(err))
 		}
@@ -137,6 +143,8 @@ func (f *FFprobeService) Probe(ctx context.Context, path string) (*ProbeResult, 
 // authorization, or a provider-specific User-Agent can still expose stream
 // metadata without downloading the whole file.
 func (f *FFprobeService) ProbeHTTP(ctx context.Context, rawURL string, headers map[string]string) (*ProbeResult, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "ffprobe.probe.http", started)
 	if f == nil {
 		return nil, errors.New("ffprobe service nil")
 	}
@@ -160,10 +168,13 @@ func (f *FFprobeService) ProbeHTTP(ctx context.Context, rawURL string, headers m
 		}
 		args = append(args, "-print_format", "json", "-show_format", "-show_streams", rawURL)
 		cmd := exec.CommandContext(probeCtx, bin, args...) // #nosec G204 -- bin is resolved by resolveLocalExecutable before execution.
+		execStarted := perftrace.Begin(ctx)
 		out, err := cmd.Output()
+		perftrace.End(ctx, "ffprobe.execute", execStarted)
 		if err == nil {
 			return parseProbeJSON(out)
 		}
+		perftrace.Count(ctx, "ffprobe.execute.error")
 		if f.log != nil {
 			f.log.Debug("remote ffprobe failed, trying ffmpeg fallback", zap.Error(err))
 		}
@@ -172,6 +183,8 @@ func (f *FFprobeService) ProbeHTTP(ctx context.Context, rawURL string, headers m
 }
 
 func (f *FFprobeService) acquire(ctx context.Context) (chan struct{}, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "ffprobe.queue.wait", started)
 	f.mu.RLock()
 	limiter := f.limiter
 	f.mu.RUnlock()
@@ -202,7 +215,9 @@ func (f *FFprobeService) probeWithFFmpeg(ctx context.Context, path string) (*Pro
 		return nil, fmt.Errorf("ffprobe/ffmpeg unavailable: %w", err)
 	}
 	f.cfg.App.FFmpegPath = bin
+	execStarted := perftrace.Begin(ctx)
 	out, _ := commandOutput(ctx, 30*time.Second, bin, "-hide_banner", "-i", path)
+	perftrace.End(ctx, "ffprobe.ffmpeg.execute", execStarted)
 	res := parseFFmpegProbeText(string(out))
 	if res.VideoCodec == "" && res.AudioCodec == "" && res.DurationSec == 0 {
 		return nil, fmt.Errorf("ffmpeg probe %s: no stream metadata parsed", path)
@@ -221,7 +236,9 @@ func (f *FFprobeService) probeHTTPWithFFmpeg(ctx context.Context, rawURL, header
 		args = append(args, "-headers", headerText)
 	}
 	args = append(args, "-i", rawURL)
+	execStarted := perftrace.Begin(ctx)
 	out, _ := commandOutput(ctx, 30*time.Second, bin, args...)
+	perftrace.End(ctx, "ffprobe.ffmpeg.execute", execStarted)
 	res := parseFFmpegProbeText(string(out))
 	if res.VideoCodec == "" && res.AudioCodec == "" && res.DurationSec == 0 {
 		return nil, fmt.Errorf("remote ffmpeg probe: no stream metadata parsed")

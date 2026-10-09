@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // ServeHLSPlaylist makes sure a transcode is running and writes the m3u8.
@@ -18,6 +20,9 @@ import (
 // the web player can scrub the full timeline without waiting for a full
 // head-to-tail transcode.
 func (s *StreamService) ServeHLSPlaylist(w http.ResponseWriter, r *http.Request, mediaID string) error {
+	ctx := r.Context()
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "hls.playlist", started)
 	// 「客户端直连解码」模式下宿主机不提供转码，HLS 一律拒绝，
 	// 迫使播放器走 direct play 本地解码。
 	if s.directPlayOnly(r.Context()) {
@@ -40,25 +45,33 @@ func (s *StreamService) ServeHLSPlaylist(w http.ResponseWriter, r *http.Request,
 		return errors.New("hls playlist not ready")
 	}
 	playlist := s.transcoder.PlaylistPath(mediaID)
+	openStarted := perftrace.Begin(ctx)
 	f, err := os.Open(playlist) // #nosec G304 -- playlist path is generated under the transcoder cache directory for this media ID.
+	perftrace.End(ctx, "hls.playlist.open", openStarted)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	statStarted := perftrace.Begin(ctx)
 	stat, _ := f.Stat()
+	perftrace.End(ctx, "hls.playlist.stat", statStarted)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Disposition", "inline")
 	if r.URL.RawQuery != "" {
-		data, err := io.ReadAll(f)
+		data, err := io.ReadAll(perftrace.Reader(ctx, f))
 		if err != nil {
 			return err
 		}
 		playlist := appendQueryToHLSSegments(string(data), r.URL.RawQuery)
+		writeStarted := perftrace.Begin(ctx)
 		_, err = io.WriteString(w, playlist)
+		perftrace.End(ctx, "hls.playlist.write", writeStarted)
 		return err
 	}
-	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+	transferStarted := perftrace.Begin(ctx)
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), perftrace.Reader(ctx, f))
+	perftrace.End(ctx, "hls.playlist.transfer", transferStarted)
 	return nil
 }
 
@@ -172,6 +185,9 @@ func filterHLSSegmentQuery(rawQuery string) string {
 
 // ServeHLSSegment writes a single .ts segment from the on-disk cache.
 func (s *StreamService) ServeHLSSegment(w http.ResponseWriter, r *http.Request, mediaID, segment string) error {
+	ctx := r.Context()
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "hls.segment", started)
 	s.transcoder.TouchJob(mediaID)
 	// Only allow segments that look like seg_NNNNN.ts so we cannot be tricked
 	// into reading arbitrary files via path traversal.
@@ -187,15 +203,22 @@ func (s *StreamService) ServeHLSSegment(w http.ResponseWriter, r *http.Request, 
 	if !pathWithin(abs, dir) {
 		return errors.New("path escape")
 	}
+	openStarted := perftrace.Begin(ctx)
 	f, err := os.Open(abs) // #nosec G304 -- abs is constrained to the HLS cache directory with pathWithin.
+	perftrace.End(ctx, "hls.segment.open", openStarted)
 	if err != nil {
+		perftrace.Count(ctx, "hls.segment.open.error")
 		return err
 	}
 	defer f.Close()
+	statStarted := perftrace.Begin(ctx)
 	stat, _ := f.Stat()
+	perftrace.End(ctx, "hls.segment.stat", statStarted)
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	w.Header().Set("Content-Disposition", "inline")
-	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+	transferStarted := perftrace.Begin(ctx)
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), perftrace.Reader(ctx, f))
+	perftrace.End(ctx, "hls.segment.transfer", transferStarted)
 	return nil
 }

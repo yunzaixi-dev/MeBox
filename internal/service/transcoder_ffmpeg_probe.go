@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
-func (t *TranscoderService) runFFmpeg(ctx context.Context, job *hlsJob, input transcodeInput) {
+func (t *TranscoderService) runFFmpeg(ctx, traceCtx context.Context, job *hlsJob, input transcodeInput) {
 	bin, err := t.resolveFFmpegPath()
 	if err != nil {
 		t.log.Warn("ffmpeg unavailable", zap.String("media_id", job.mediaID), zap.Error(err))
@@ -50,7 +52,16 @@ func (t *TranscoderService) runFFmpeg(ctx context.Context, job *hlsJob, input tr
 		"start_sec": input.StartSec,
 	})
 
-	if err := cmd.Run(); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
+	start := perftrace.Begin(traceCtx)
+	err = cmd.Start()
+	perftrace.End(traceCtx, "hls.ffmpeg.start", start)
+	if err != nil {
+		perftrace.Count(traceCtx, "hls.ffmpeg.start.error")
+	}
+	if err == nil {
+		err = cmd.Wait()
+	}
+	if err != nil && !errors.Is(ctx.Err(), context.Canceled) {
 		t.log.Warn("ffmpeg exited",
 			zap.String("media_id", job.mediaID),
 			zap.Float64("start_sec", input.StartSec),

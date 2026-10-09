@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // errOpenListAPITokenExpired 标记 OpenList 返回 401（登录 token 已失效）：
@@ -70,12 +72,12 @@ func (p *cloudDrive2Provider) listOpenListAPIWithToken(ctx context.Context, dir,
 		if token != "" {
 			req.Header.Set("Authorization", token)
 		}
-		resp, err := p.client.Do(req)
+		resp, err := p.client.Do(perftrace.Request(req))
 		if err != nil {
 			return nil, decorateDAVTransportError(p.name, p.openListAPIURL("/api/fs/list"), err)
 		}
 		var decoded openListListResponse
-		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&decoded)
+		decodeErr := json.NewDecoder(io.LimitReader(perftrace.Body(req, resp.Body), 32<<20)).Decode(&decoded)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusUnauthorized {
 			return nil, errOpenListAPITokenExpired
@@ -137,7 +139,7 @@ func (p *cloudDrive2Provider) resolveOpenListAPIDirectWithToken(ctx context.Cont
 	if token != "" {
 		req.Header.Set("Authorization", token)
 	}
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Do(perftrace.Request(req))
 	if err != nil {
 		return nil, decorateDAVTransportError(p.name, p.openListAPIURL("/api/fs/get"), err)
 	}
@@ -149,7 +151,7 @@ func (p *cloudDrive2Provider) resolveOpenListAPIDirectWithToken(ctx context.Cont
 		return nil, p.openListAPIStatusError("get", fileRef, resp.StatusCode)
 	}
 	var decoded openListGetResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&decoded); err != nil {
+	if err := json.NewDecoder(io.LimitReader(perftrace.Body(req, resp.Body), 4<<20)).Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("%s: decode api get: %w", p.name, err)
 	}
 	if decoded.Code != 0 && decoded.Code != 200 {
@@ -249,7 +251,7 @@ func (p *cloudDrive2Provider) openListAPILogin(ctx context.Context) (string, err
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", p.ua)
-	resp, err := p.client.Do(req)
+	resp, err := p.client.Do(perftrace.Request(req))
 	if err != nil {
 		return "", decorateDAVTransportError(p.name, p.openListAPIURL("/api/auth/login"), err)
 	}
@@ -258,7 +260,7 @@ func (p *cloudDrive2Provider) openListAPILogin(ctx context.Context) (string, err
 		return "", fmt.Errorf("%s: api login returned http %d", p.name, resp.StatusCode)
 	}
 	var decoded openListLoginResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&decoded); err != nil {
+	if err := json.NewDecoder(io.LimitReader(perftrace.Body(req, resp.Body), 4<<20)).Decode(&decoded); err != nil {
 		return "", fmt.Errorf("%s: decode api login: %w", p.name, err)
 	}
 	if decoded.Code != 0 && decoded.Code != 200 {

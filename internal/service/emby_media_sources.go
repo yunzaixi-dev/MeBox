@@ -8,9 +8,12 @@ import (
 	"strings"
 
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 func (e *EmbyService) mediaSourcesForItem(ctx context.Context, m *model.Media, asEmbedded, directOnly bool) []map[string]any {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.media_sources", started)
 	siblings := e.mediaVersionSiblings(ctx, m)
 	if len(siblings) == 0 {
 		return []map[string]any{e.mediaSource(ctx, m, asEmbedded, directOnly)}
@@ -24,6 +27,8 @@ func (e *EmbyService) mediaSourcesForItem(ctx context.Context, m *model.Media, a
 }
 
 func (e *EmbyService) mediaVersionSiblings(ctx context.Context, m *model.Media) []model.Media {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.versions", started)
 	if e == nil || e.repo == nil || e.repo.DB == nil || m == nil || strings.TrimSpace(m.ID) == "" {
 		return nil
 	}
@@ -52,9 +57,14 @@ func (e *EmbyService) mediaVersionSiblings(ctx context.Context, m *model.Media) 
 		}
 	}
 	var rows []model.Media
-	if err := q.Find(&rows).Error; err != nil || len(rows) == 0 {
+	queryStarted := perftrace.Begin(ctx)
+	err := q.Find(&rows).Error
+	perftrace.End(ctx, "playback.versions.sql", queryStarted)
+	if err != nil || len(rows) == 0 {
 		return []model.Media{*m}
 	}
+	filterStarted := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.versions.filter", filterStarted)
 	targetKey := e.mediaVersionKey(ctx, m)
 	filtered := rows[:0]
 	for i := range rows {
@@ -223,9 +233,9 @@ func (e *EmbyService) mediaStreams(ctx context.Context, m *model.Media) []map[st
 // The streams follow the official Emby external-subtitle contract:
 //   - Codec reports the source codec (ass/ssa/subrip/vtt), matching the RAW
 //     bytes served at the DeliveryUrl (see ServeSubtitleStream / ServeRaw).
-//   - Index is stable and global across the MediaSource (Video 0, Audio 1,
-//     subtitles 2, 3, ...). It never shifts to 1 when audio is absent.
-//   - IsDefault is false (external subtitles are never auto-selected).
+//   - Index is global across the MediaSource: Video 0, Audio 1 when present,
+//     followed by subtitles starting at 1 without audio or 2 with audio.
+//   - The best Simplified or generic Chinese sidecar is marked IsDefault.
 //   - Path and DeliveryMethod identify the sidecar file.
 func (e *EmbyService) appendSubtitleStreams(ctx context.Context, streams []map[string]any, m *model.Media) []map[string]any {
 	if e == nil || e.subtitle == nil || m == nil {
@@ -245,6 +255,7 @@ func (e *EmbyService) appendSubtitleStreams(ctx context.Context, streams []map[s
 		next = 2
 	}
 	mediaID := strings.TrimSpace(m.ID)
+	firstSubtitleIndex := next
 	for _, t := range tracks {
 		index := next
 		next++
@@ -258,7 +269,7 @@ func (e *EmbyService) appendSubtitleStreams(ctx context.Context, streams []map[s
 			"IsExternal":     true,
 			"IsForced":       false,
 			"IsDefault":      false,
-			"Language":       t.Lang,
+			"Language":       embySubtitleLanguageCode(t.Lang),
 			"DisplayTitle":   subtitleDisplayTitle(t),
 			"Path":           strings.TrimSpace(t.Path),
 			"DeliveryMethod": "External",
@@ -273,6 +284,7 @@ func (e *EmbyService) appendSubtitleStreams(ctx context.Context, streams []map[s
 			"DeliveryUrl":            "/Videos/" + mediaID + "/" + mediaID + "/Subtitles/" + fmt.Sprint(index) + "/Stream." + codec,
 		})
 	}
+	markPreferredEmbySubtitle(streams, tracks, firstSubtitleIndex)
 	return streams
 }
 

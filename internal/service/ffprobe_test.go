@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/truewhile/MeBox/internal/config"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 func TestFFprobeServiceDefaultsToSingleConcurrentProbe(t *testing.T) {
@@ -40,8 +42,13 @@ func TestFFprobeAcquireHonorsContextWhenLimitReached(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
 	defer cancel()
-	if _, err := svc.acquire(ctx); err == nil {
-		t.Fatal("second acquire should block until context deadline")
+	ctx, trace := perftrace.New(ctx)
+	if _, err := svc.acquire(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second acquire error = %v, want context deadline exceeded", err)
+	}
+	snapshot := trace.Finish()
+	if len(snapshot.Metrics) != 1 || snapshot.Metrics[0].Name != "ffprobe.queue.wait" || snapshot.Metrics[0].Count != 1 {
+		t.Fatalf("blocked probe trace = %+v", snapshot.Metrics)
 	}
 	svc.release(token)
 	token, err = svc.acquire(t.Context())

@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"path"
 	"strings"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 func (p *cloudDrive2Provider) List(ctx context.Context, dir string) ([]FileEntry, error) {
@@ -28,11 +30,15 @@ func (p *cloudDrive2Provider) List(ctx context.Context, dir string) ([]FileEntry
 	req.Header.Set("Depth", "1")
 	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
 	req.Header.Set("Accept", "application/xml,text/xml,*/*")
+	req = perftrace.Request(req)
+	headerStart := perftrace.Begin(ctx)
 	resp, err := p.client.Do(req)
+	perftrace.End(ctx, "upstream.headers", headerStart)
 	if err != nil {
 		return nil, decorateDAVTransportError(p.name, p.urlFor(target), err)
 	}
 	defer resp.Body.Close()
+	resp.Body = perftrace.Body(req, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, p.decorateDAVStatusError(resp, target)
 	}
@@ -112,7 +118,10 @@ func (p *cloudDrive2Provider) firstHTTPRedirectLocation(ctx context.Context, tar
 	noFollow.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	req = perftrace.Request(req)
+	headerStart := perftrace.Begin(ctx)
 	resp, err := noFollow.Do(req)
+	perftrace.End(ctx, "upstream.headers", headerStart)
 	if err != nil {
 		return "", 0, err
 	}

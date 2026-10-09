@@ -39,6 +39,7 @@ func Open(cfg *config.Config, log *zap.Logger) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gorm open: %w", err)
 	}
+	installDatabasePerformance(db)
 	if dialect == "sqlite" {
 		installSQLiteWriteGate(db)
 	}
@@ -52,7 +53,7 @@ func newGormLogger(log *zap.Logger) logger.Interface {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return logger.New(
+	return performanceGormLogger{Interface: logger.New(
 		zapStdLogger{log: log},
 		logger.Config{
 			SlowThreshold:             0,
@@ -60,7 +61,7 @@ func newGormLogger(log *zap.Logger) logger.Interface {
 			IgnoreRecordNotFoundError: true,
 			Colorful:                  false,
 		},
-	)
+	)}
 }
 
 func configureConnectionPool(db *gorm.DB, cfg *config.Config) error {

@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/truewhile/MeBox/internal/config"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // sqliteGateHoldLimit 是写闸持有者的最长合法持有时长。语句级写闸在 SQL
@@ -31,7 +32,12 @@ func installSQLiteWriteGate(db *gorm.DB) {
 		if tx.Statement != nil && tx.Statement.Context != nil {
 			ctx = tx.Statement.Context
 		}
+		start := perftrace.Begin(ctx)
 		holder, err := gate.Lock(ctx)
+		perftrace.End(ctx, "db.sqlite.write_gate.wait", start)
+		if err != nil && !start.IsZero() {
+			perftrace.Count(ctx, "db.sqlite.write_gate.error")
+		}
 		if err != nil {
 			_ = tx.AddError(err)
 			return

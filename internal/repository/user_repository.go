@@ -17,6 +17,9 @@ type UserRepository struct{ db *gorm.DB }
 
 // Create inserts a new user. Caller must pre-hash the password.
 func (r *UserRepository) Create(ctx context.Context, u *model.User) error {
+	if u != nil && u.SubtitleChineseMode == "" {
+		u.SubtitleChineseMode = "simplified"
+	}
 	return r.db.WithContext(ctx).Create(u).Error
 }
 

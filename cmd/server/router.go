@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -24,8 +25,14 @@ func buildRouter(cfg *config.Config, logger *zap.Logger, embyCompatLogger *zap.L
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
+	traceEnabled, _ := strconv.ParseBool(os.Getenv("MEBOX_PERFORMANCE_TRACE"))
+	if traceEnabled {
+		r.Use(middleware.PerformanceTrace(embyCompatLogger))
+	}
 	r.Use(gin.Recovery())
-	r.Use(middleware.RequestLogger(logger))
+	if !traceEnabled {
+		r.Use(middleware.RequestLogger(logger))
+	}
 	r.Use(middleware.EmbyCompatLogger(embyCompatLogger, func(path string) bool {
 		return !isFrontendLibraryRoute(path) && handler.IsEmbyPath(path)
 	}))

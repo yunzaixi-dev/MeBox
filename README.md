@@ -60,6 +60,46 @@
 - **前端**：React 18 · Vite · TypeScript · Tailwind CSS · Zustand
 - **部署**：Docker Compose 多档模板，支持 amd64 / arm64 镜像与单文件可执行发布
 
+### 本地 fork：AMS 中文字幕补丁
+
+本 fork 已迁入 AMS `/root/zhsubs/mebox-src` 的实际中文字幕业务补丁，后续发布应构建本 fork，而不是假定上游 `latest` 镜像包含这些变更。本次源码同步不代表已更新在线容器。
+
+- 新建用户仅在 `SubtitleChineseMode` 为空时默认使用 `simplified`；显式偏好和旧用户记录保持不变，不做数据库回填。
+- 外挂字幕按「简体 → 泛中文 → 繁体 → 其他」稳定排序，同类保持发现顺序。简体/泛中文标签为 `简体中文`，繁体为 `繁體中文`，英语为 `English`；Emby 语言代码归一为中文 `chi`、英语 `eng`。
+- Emby 播放载荷默认选择第一条最优简体/泛中文字幕；只有繁体或其他语言时不设置默认字幕。`DefaultSubtitleStreamIndex` 对应实际 `MediaStreams.Index` 和字幕下载索引（无音轨从 1 开始，有音轨从 2 开始）。
+
+| 环境变量 | 默认值 | 覆盖行为 |
+| --- | --- | --- |
+| `MEBOX_EMBY_SUBTITLE_LANGUAGE` | `chi` | 覆盖 Emby 用户配置的字幕语言；`-` 表示空语言偏好 |
+| `MEBOX_EMBY_SUBTITLE_MODE` | `Always` | 覆盖 Emby 用户配置的字幕模式，例如 `Default`、`None` |
+
+环境变量会去除首尾空白，未设置或仅空白时使用默认值；只影响 Emby 用户配置，不修改网页用户偏好或外挂字幕排序。
+
+外挂格式仍仅支持 `.srt`、`.ass`、`.ssa`、`.vtt`，不新增 `.sub`、`.idx`、`.sup` 等格式。文件名语言识别保持云端原逻辑：例如 `Movie.zh-CN.srt`、`Movie.zh_Hant.ass` 可识别；`Movie.zh-CN.default.srt`、`Movie.zh-Hans.forced.ass` 的尾缀会被识别为 `default`/`forced`，并非中文，本轮不扩展此规则。
+
+### 请求与播放性能追踪
+
+设置 `MEBOX_PERFORMANCE_TRACE=true` 后启动核心，即为每个请求（含静态文件和健康检查）生成服务端 `X-Request-ID`。
+完整追踪使用现有独立 INFO 兼容日志 sink，默认写入 `/data/logs/emby-compat.log`，`msg=performance`；
+不受普通应用 WARN 级别过滤，沿用现有日志轮转。默认关闭；关闭时没有 trace 对象、额外计时或流包装。
+新追踪字段不记录 URL/query、请求体、认证头、SQL 参数、媒体路径或上游直链。日志仍应作为私有运维数据保管。
+
+- `db.sql`：SQL 次数及累计／最大时长，包含 GORM callback、pool 获取与结果扫描；另记录 SQLite 写闸、BEGIN、busy retry 和 backoff。
+- `playback.*`、`subtitle.*`、`hls.*`、`ffprobe.*`：播放准备、版本查询／过滤、缓存 hit/miss、目录扫描、文件操作、转码启动／ready／旧 job 退出、探测排队及执行。
+- `stream.read/seek` 与 `http.write/flush`：区分本地读盘等待与向客户端写入的回压；上游单独记录 `upstream.read`。
+- `upstream.*`：标准 `httptrace` 的连接获取、连接复用、DNS、TCP、TLS、首个响应字节；115 另记录请求队列和重试。
+
+`trace.metrics` 的 `total_ns/max_ns` 和慢事件的 `offset_ns/duration_ns` 均为纳秒。时长为 inclusive，可嵌套、并发重叠，
+不能相加冒充请求总时长。每请求最多 64 类指标、32 个 ≥100ms 慢事件；截断有明确计数，不逐 chunk 写日志。
+`http.response_ready` 是应用准备提交响应的时间，**不是客户端 TTFB**；边缘缓存命中还可能复用旧响应里的请求 ID。
+必须把真实客户端的 TTFB、持续 Range 读取、Nginx／Tunnel 和主机观测一起比对，不能仅看服务端总耗时判断卡顿。
+
+AMS 核心更新使用 `Dockerfile.ams`：先以 `CGO_ENABLED=0` 构建本 fork 的静态 `mebox`，再在私有临时 build context
+放入该二进制与 Dockerfile。显式提供 `AMS_BASE_IMAGE` 为已核验的本地 AMS 基线镜像、`REVISION` 为提交 SHA，
+观测版额外提供 `PERFORMANCE_TRACE=true`。只替换 `/usr/local/bin/mebox`，保留原镜像的网页、FFmpeg、entrypoint 和系统包；
+最终按实际镜像 ID 发布，不移动 `latest` 或覆盖原镜像。现有数据库、JWT 密钥和六个 bind 保持，升级前另做 WAL 一致性备份。
+
+
 ---
 
 ## 快速开始

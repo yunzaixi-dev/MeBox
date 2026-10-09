@@ -9,6 +9,8 @@ export interface DatabaseStatus {
   in_use: number
   idle: number
   max_open_conns: number
+  global_wait_count?: number
+  global_wait_duration_ms?: number
   table_counts?: Record<string, number>
 }
 

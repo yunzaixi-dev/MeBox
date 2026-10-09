@@ -533,3 +533,57 @@ func TestMediaSearchIndexBackfillRunsInBatches(t *testing.T) {
 		t.Fatalf("soft delete should drop fts row, got %d", after)
 	}
 }
+
+func TestUserCreateSubtitlePreference(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := db.AutoMigrate(&model.User{}); err != nil {
+		t.Fatal(err)
+	}
+	oldPrefs := []string{"", "original", "simplified", "traditional"}
+	for _, pref := range oldPrefs {
+		old := &model.User{Username: "old-" + pref, PasswordHash: "hash", SubtitleChineseMode: pref}
+		if err := db.Create(old).Error; err != nil {
+			t.Fatal(err)
+		}
+		// Bypass the model's insert default to represent an old empty preference.
+		if err := db.Model(old).UpdateColumn("subtitle_chinese_mode", pref).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	repos := New(db)
+	for _, tc := range []struct{ input, want string }{
+		{"", "simplified"},
+		{"original", "original"},
+		{"simplified", "simplified"},
+		{"traditional", "traditional"},
+	} {
+		user := &model.User{Username: "new-" + tc.input, PasswordHash: "hash", SubtitleChineseMode: tc.input}
+		if err := repos.User.Create(t.Context(), user); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := repos.User.FindByID(t.Context(), user.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("find new user: %v", err)
+		}
+		if user.SubtitleChineseMode != tc.want || stored.SubtitleChineseMode != tc.want {
+			t.Fatalf("new preference for %q = %q, stored = %q, want %q", tc.input, user.SubtitleChineseMode, stored.SubtitleChineseMode, tc.want)
+		}
+	}
+	for _, pref := range oldPrefs {
+		stored, err := repos.User.FindByUsername(t.Context(), "old-"+pref)
+		if err != nil || stored == nil {
+			t.Fatalf("find old user: %v", err)
+		}
+		if stored.SubtitleChineseMode != pref {
+			t.Fatalf("old preference changed from %q to %q", pref, stored.SubtitleChineseMode)
+		}
+	}
+}

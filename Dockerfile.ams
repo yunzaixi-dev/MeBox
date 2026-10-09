@@ -1,0 +1,12 @@
+# Build with a private context containing this file and the static `mebox` binary.
+# AMS_BASE_IMAGE must identify the locally loaded, captured AMS runtime image.
+ARG AMS_BASE_IMAGE
+FROM ${AMS_BASE_IMAGE}
+ARG AMS_BASE_IMAGE
+ARG REVISION
+ARG PERFORMANCE_TRACE=false
+LABEL org.opencontainers.image.source="https://github.com/yunzaixi-dev/MeBox" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.base.name="${AMS_BASE_IMAGE}"
+ENV MEBOX_PERFORMANCE_TRACE=${PERFORMANCE_TRACE}
+COPY mebox /usr/local/bin/mebox

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // OpenClient 是 115 开放平台客户端。
@@ -130,6 +132,8 @@ type RespBase struct {
 
 // doJSON 执行 HTTP 请求并解析为统一响应；带 AccessToken（access=true 时）。
 func (c *OpenClient) doJSON(ctx context.Context, method, rawURL string, form map[string]string, access bool, retries int, uas ...string) (*RespBase, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "cloud115.request", started)
 	executor := c.executor
 	if executor == nil {
 		executor = GetGlobalExecutor()
@@ -141,9 +145,13 @@ func (c *OpenClient) doJSON(ctx context.Context, method, rawURL string, form map
 
 	var lastErr error
 	for attempt := 0; attempt <= retries; attempt++ {
+		perftrace.Count(ctx, "cloud115.attempt")
 		// 1. 获取全局三级令牌桶（QPS/QPM/QPH）令牌，若在熔断状态则阻塞等待冷却
-		if err := executor.Acquire(ctx); err != nil {
-			return nil, err
+		acquireStart := perftrace.Begin(ctx)
+		acquireErr := executor.Acquire(ctx)
+		perftrace.End(ctx, "cloud115.queue_wait", acquireStart)
+		if acquireErr != nil {
+			return nil, acquireErr
 		}
 
 		req, err := c.buildRequestWithUA(ctx, method, rawURL, form, access, ua)
@@ -152,17 +160,22 @@ func (c *OpenClient) doJSON(ctx context.Context, method, rawURL string, form map
 		}
 		attemptedAccess := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
 
+		headerStart := perftrace.Begin(ctx)
 		resp, err := c.HTTP.Do(req)
+		perftrace.End(ctx, "upstream.headers", headerStart)
 		if err != nil {
+			perftrace.Count(ctx, "upstream.request_error")
 			lastErr = err
 			if attempt < retries {
+				retryStart := perftrace.Begin(ctx)
 				time.Sleep(time.Duration(attempt+1) * 1 * time.Second)
+				perftrace.End(ctx, "cloud115.retry_backoff", retryStart)
 				continue
 			}
 			return nil, err
 		}
 
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		body, readErr := io.ReadAll(io.LimitReader(perftrace.Body(req, resp.Body), 16<<20))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = readErr
@@ -186,7 +199,9 @@ func (c *OpenClient) doJSON(ctx context.Context, method, rawURL string, form map
 			}
 			lastErr = fmt.Errorf("115 接口返回 HTTP %d：%s", resp.StatusCode, strings.TrimSpace(string(body)))
 			if attempt < retries {
+				retryStart := perftrace.Begin(ctx)
 				time.Sleep(time.Duration(attempt+1) * 1 * time.Second)
+				perftrace.End(ctx, "cloud115.retry_backoff", retryStart)
 				continue
 			}
 			return nil, lastErr
@@ -290,7 +305,7 @@ func (c *OpenClient) buildRequestWithUA(ctx context.Context, method, rawURL stri
 			req.Header.Set("Authorization", "Bearer "+accessToken)
 		}
 	}
-	return req, nil
+	return perftrace.Request(req), nil
 }
 
 // doAuthJSON 带 AccessToken 的业务请求。

@@ -6,12 +6,16 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // WaitReady blocks (with a deadline) until the playlist file shows up on
 // disk for the *current* job generation. Stale playlists left behind by a
 // failed RemoveAll / still-exiting ffmpeg must not unblock a mid-file restart.
 func (t *TranscoderService) WaitReady(ctx context.Context, mediaID string, timeout time.Duration) bool {
+	traceStarted := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "hls.ready.wait", traceStarted)
 	deadline := time.Now().Add(timeout)
 	for {
 		t.mu.Lock()
@@ -22,7 +26,10 @@ func (t *TranscoderService) WaitReady(ctx context.Context, mediaID string, timeo
 		}
 		t.mu.Unlock()
 		if ok {
-			if info, err := os.Stat(t.PlaylistPath(mediaID)); err == nil {
+			statStarted := perftrace.Begin(ctx)
+			info, err := os.Stat(t.PlaylistPath(mediaID))
+			perftrace.End(ctx, "hls.ready.stat", statStarted)
+			if err == nil {
 				// Allow a small clock skew; reject anything older than this job.
 				if !info.ModTime().Before(started.Add(-2 * time.Second)) {
 					t.mu.Lock()
@@ -35,10 +42,12 @@ func (t *TranscoderService) WaitReady(ctx context.Context, mediaID string, timeo
 			}
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
+			perftrace.Count(ctx, "hls.ready.failed")
 			return false
 		}
 		select {
 		case <-ctx.Done():
+			perftrace.Count(ctx, "hls.ready.failed")
 			return false
 		case <-time.After(250 * time.Millisecond):
 		}

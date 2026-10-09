@@ -105,10 +105,10 @@ func (e *EmbyService) userPayload(u *model.User) map[string]any {
 			"PlayDefaultAudioTrack":      true,
 			"DisplayCollectionsView":     true,
 			"DisplayMissingEpisodes":     false,
-			"SubtitleMode":               "Default",
+			"SubtitleMode":               embySubtitleModePref(),
 			"EnableNextEpisodeAutoPlay":  true,
 			"AudioLanguagePreference":    "",
-			"SubtitleLanguagePreference": "",
+			"SubtitleLanguagePreference": embySubtitleLanguagePref(),
 		},
 		"Policy": map[string]any{
 			"IsAdministrator":                u.Role == "admin",

@@ -37,6 +37,7 @@ import (
 	"github.com/truewhile/MeBox/internal/config"
 	"github.com/truewhile/MeBox/internal/helper"
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/repository"
 )
 
@@ -174,6 +175,8 @@ func (t *TranscoderService) EnsureJobFromSubtitle(ctx context.Context, mediaID s
 // EnsureJobFromSubtitleQuality is EnsureJobFromSubtitle with an explicit local
 // HLS quality profile. Empty qualityID keeps the global transcoder config.
 func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, mediaID string, startSec float64, seekGen int64, subtitleStream int, qualityID string) (string, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "hls.prepare", started)
 	if !t.cfg.Transcoder.Enabled {
 		return "", ErrTranscodeDisabled
 	}
@@ -189,7 +192,9 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 		quality = &profile
 		qualityID = profile.ID
 	}
+	lookupStarted := perftrace.Begin(ctx)
 	m, err := t.repo.Media.FindByID(ctx, mediaID)
+	perftrace.End(ctx, "hls.media.lookup", lookupStarted)
 	if err != nil {
 		return "", err
 	}
@@ -198,7 +203,9 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 	}
 
 	gate := t.mediaStartGate(mediaID)
+	gateStarted := perftrace.Begin(ctx)
 	gate.Lock()
+	perftrace.End(ctx, "hls.start_gate.wait", gateStarted)
 	defer gate.Unlock()
 
 	t.mu.Lock()
@@ -215,7 +222,9 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 		}
 		prev := t.detachJobLocked(mediaID)
 		t.mu.Unlock()
+		exitStarted := perftrace.Begin(ctx)
 		waitJobExit(prev, 12*time.Second)
+		perftrace.End(ctx, "hls.previous_exit.wait", exitStarted)
 	} else {
 		t.mu.Unlock()
 	}
@@ -230,14 +239,20 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 	}
 	input.Quality = quality
 	t.maybeFillDuration(ctx, m, input)
-	if _, err := t.resolveFFmpegPath(); err != nil {
+	binaryStarted := perftrace.Begin(ctx)
+	_, err = t.resolveFFmpegPath()
+	perftrace.End(ctx, "hls.ffmpeg.resolve", binaryStarted)
+	if err != nil {
 		return "", err
 	}
 
 	outDir := t.HLSDir(mediaID)
 	// Wipe prior segments so a mid-file restart cannot serve stale early chunks.
 	// Only safe after the previous ffmpeg has exited (waited above / via gate).
-	if err := resetHLSDir(outDir); err != nil {
+	resetStarted := perftrace.Begin(ctx)
+	err = resetHLSDir(outDir)
+	perftrace.End(ctx, "hls.cache.reset", resetStarted)
+	if err != nil {
 		return "", err
 	}
 
@@ -255,7 +270,9 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 		}
 		prev := t.detachJobLocked(mediaID)
 		t.mu.Unlock()
+		exitStarted := perftrace.Begin(ctx)
 		waitJobExit(prev, 12*time.Second)
+		perftrace.End(ctx, "hls.previous_exit.wait", exitStarted)
 		t.mu.Lock()
 	}
 	if max := t.maxConcurrent(); max > 0 && len(t.jobs) >= max {
@@ -285,9 +302,10 @@ func (t *TranscoderService) EnsureJobFromSubtitleQuality(ctx context.Context, me
 	t.mu.Unlock()
 
 	helper.Go(t.log, "transcoder.monitorIdle", func() { t.monitorIdle(jobCtx, job) })
+	traceCtx := perftrace.Detach(ctx)
 	helper.Go(t.log, "transcoder.ffmpeg", func() {
 		defer close(job.done)
-		t.runFFmpeg(jobCtx, job, input)
+		t.runFFmpeg(jobCtx, traceCtx, job, input)
 	})
 	return t.PlaylistPath(mediaID), nil
 }

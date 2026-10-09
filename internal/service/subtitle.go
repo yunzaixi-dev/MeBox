@@ -33,6 +33,7 @@ import (
 
 	"github.com/truewhile/MeBox/internal/config"
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/repository"
 )
 
@@ -94,10 +95,14 @@ func (s *SubtitleService) Discover(ctx context.Context, mediaID string) ([]Subti
 // DiscoverExternalOnly 只返回媒体旁边的外挂字幕文件，不含容器内嵌字幕轨。
 // Emby 字幕接口（/Videos/:id/Subtitles/...）用。
 func (s *SubtitleService) DiscoverExternalOnly(ctx context.Context, mediaID string) ([]SubtitleTrack, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.discover.external", started)
 	cacheKey := "external:" + mediaID
 	if tracks, ok := s.cachedDiscovery(cacheKey); ok {
+		perftrace.Count(ctx, "subtitle.cache.hit")
 		return tracks, nil
 	}
+	perftrace.Count(ctx, "subtitle.cache.miss")
 	tracks, err := s.discoverExternalUncached(ctx, mediaID)
 	if err != nil {
 		return nil, err
@@ -107,10 +112,14 @@ func (s *SubtitleService) DiscoverExternalOnly(ctx context.Context, mediaID stri
 }
 
 func (s *SubtitleService) discover(ctx context.Context, mediaID string) ([]SubtitleTrack, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.discover", started)
 	cacheKey := "all:" + mediaID
 	if tracks, ok := s.cachedDiscovery(cacheKey); ok {
+		perftrace.Count(ctx, "subtitle.cache.hit")
 		return tracks, nil
 	}
+	perftrace.Count(ctx, "subtitle.cache.miss")
 	tracks, err := s.discoverUncached(ctx, mediaID)
 	if err != nil {
 		return nil, err
@@ -159,7 +168,7 @@ func (s *SubtitleService) discoverUncached(ctx context.Context, mediaID string) 
 	if m == nil {
 		return nil, errors.New("media not found")
 	}
-	tracks := discoverExternalSubtitleTracks(m)
+	tracks := discoverExternalSubtitleTracks(ctx, m)
 	embedded, err := s.discoverEmbedded(ctx, m)
 	if err != nil {
 		if s.log != nil {
@@ -179,10 +188,12 @@ func (s *SubtitleService) discoverExternalUncached(ctx context.Context, mediaID 
 	if m == nil {
 		return nil, errors.New("media not found")
 	}
-	return discoverExternalSubtitleTracks(m), nil
+	return discoverExternalSubtitleTracks(ctx, m), nil
 }
 
-func discoverExternalSubtitleTracks(m *model.Media) []SubtitleTrack {
+func discoverExternalSubtitleTracks(ctx context.Context, m *model.Media) []SubtitleTrack {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.files.scan", started)
 	dir := filepath.Dir(m.Path)
 	bases := mediaSidecarBaseVariants(m.Path)
 	if len(bases) == 0 {
@@ -197,7 +208,9 @@ func discoverExternalSubtitleTracks(m *model.Media) []SubtitleTrack {
 
 	tracks := make([]SubtitleTrack, 0)
 	for _, c := range candidates {
+		readDirStarted := perftrace.Begin(ctx)
 		entries, err := os.ReadDir(c)
+		perftrace.End(ctx, "subtitle.files.read_dir", readDirStarted)
 		if err != nil {
 			continue
 		}
@@ -230,7 +243,7 @@ func discoverExternalSubtitleTracks(m *model.Media) []SubtitleTrack {
 			lang := detectLang(fullName, matchedBase)
 			tracks = append(tracks, SubtitleTrack{
 				Lang:     lang,
-				Label:    lang,
+				Label:    zhSubtitleLabel(lang),
 				Path:     filepath.Join(c, e.Name()),
 				Codec:    codec,
 				Source:   "external",
@@ -238,6 +251,7 @@ func discoverExternalSubtitleTracks(m *model.Media) []SubtitleTrack {
 			})
 		}
 	}
+	sortSubtitleTracksZhFirst(tracks)
 	return tracks
 }
 
@@ -264,6 +278,8 @@ var imageSubtitleCodecs = map[string]bool{
 }
 
 func (s *SubtitleService) discoverEmbedded(ctx context.Context, media *model.Media) ([]SubtitleTrack, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.discover.embedded", started)
 	if s == nil || s.cfg == nil {
 		return nil, errors.New("subtitle probe unavailable")
 	}
@@ -286,8 +302,11 @@ func (s *SubtitleService) discoverEmbedded(ctx context.Context, media *model.Med
 		"-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced",
 		"-of", "json", input.Source,
 	)
+	probeStarted := perftrace.Begin(ctx)
 	out, err := exec.CommandContext(probeCtx, bin, args...).Output() // #nosec G204 -- executable is resolved locally and arguments do not use a shell.
+	perftrace.End(ctx, "ffprobe.subtitle.execute", probeStarted)
 	if err != nil {
+		perftrace.Count(ctx, "ffprobe.subtitle.error")
 		return nil, err
 	}
 	var probe embeddedSubtitleProbe
@@ -358,7 +377,10 @@ func (s *SubtitleService) resolveInput(ctx context.Context, media *model.Media) 
 		return transcodeInput{}, ErrMediaNotFound
 	}
 	if !isStrmMediaRow(media) {
-		if _, err := os.Stat(media.Path); err != nil {
+		statStarted := perftrace.Begin(ctx)
+		_, err := os.Stat(media.Path)
+		perftrace.End(ctx, "subtitle.source.stat", statStarted)
+		if err != nil {
 			return transcodeInput{}, ErrMediaNotFound
 		}
 		return transcodeInput{Source: media.Path}, nil
@@ -399,6 +421,8 @@ func detectLang(name, base string) string {
 // converted minimally on the fly. Returns ErrSubtitleNotFound when the
 // path is rejected (path traversal / not in the media directory).
 func (s *SubtitleService) Serve(ctx context.Context, mediaID, sub string, w io.Writer) error {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.serve", started)
 	m, err := s.repo.Media.FindByID(ctx, mediaID)
 	if err != nil || m == nil {
 		return errors.New("media not found")
@@ -415,12 +439,14 @@ func (s *SubtitleService) Serve(ctx context.Context, mediaID, sub string, w io.W
 		return err
 	}
 
+	openStarted := perftrace.Begin(ctx)
 	f, err := os.Open(abs) // #nosec G304 -- abs is constrained to the media file directory with pathWithin.
+	perftrace.End(ctx, "subtitle.file.open", openStarted)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	body, err := io.ReadAll(f)
+	body, err := io.ReadAll(perftrace.Reader(ctx, f))
 	if err != nil {
 		return err
 	}
@@ -428,6 +454,8 @@ func (s *SubtitleService) Serve(ctx context.Context, mediaID, sub string, w io.W
 	// UTF-8 解析 <track> 内容，否则整篇都会变成替换字符。
 	text := decodeSubtitleText(body)
 
+	writeStarted := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.write", writeStarted)
 	switch strings.ToLower(filepath.Ext(abs)) {
 	case ".vtt":
 		_, err = io.WriteString(w, text)
@@ -442,6 +470,8 @@ func (s *SubtitleService) Serve(ctx context.Context, mediaID, sub string, w io.W
 }
 
 func (s *SubtitleService) serveEmbedded(ctx context.Context, media *model.Media, streamIndex int, w io.Writer) error {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.extract", started)
 	input, err := s.resolveInput(ctx, media)
 	if err != nil {
 		return err
@@ -471,6 +501,8 @@ func (s *SubtitleService) serveEmbedded(ctx context.Context, media *model.Media,
 // browser <track> path, which requires WebVTT), ServeRaw preserves the file
 // exactly as-is. Same path-safety constraints as Serve.
 func (s *SubtitleService) ServeRaw(ctx context.Context, mediaID, sub string, w io.Writer) error {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.serve.raw", started)
 	m, err := s.repo.Media.FindByID(ctx, mediaID)
 	if err != nil || m == nil {
 		return errors.New("media not found")
@@ -489,12 +521,16 @@ func (s *SubtitleService) ServeRaw(ctx context.Context, mediaID, sub string, w i
 	if _, ok := extToCodec[strings.ToLower(filepath.Ext(abs))]; !ok {
 		return errors.New("unsupported subtitle format")
 	}
+	openStarted := perftrace.Begin(ctx)
 	f, err := os.Open(abs) // #nosec G304 -- abs is constrained to the media file directory with pathWithin.
+	perftrace.End(ctx, "subtitle.file.open", openStarted)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(w, f)
+	transferStarted := perftrace.Begin(ctx)
+	_, err = io.Copy(w, perftrace.Reader(ctx, f))
+	perftrace.End(ctx, "subtitle.transfer", transferStarted)
 	return err
 }
 
@@ -503,6 +539,8 @@ func (s *SubtitleService) ServeRaw(ctx context.Context, mediaID, sub string, w i
 // ffmpeg. This keeps fonts, positioning and typesetting data available to the
 // browser renderer instead of flattening the track through assToVTT first.
 func (s *SubtitleService) ServeASS(ctx context.Context, mediaID, sub string, w io.Writer) error {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.serve.ass", started)
 	m, err := s.repo.Media.FindByID(ctx, mediaID)
 	if err != nil || m == nil {
 		return errors.New("media not found")
@@ -522,16 +560,20 @@ func (s *SubtitleService) ServeASS(ctx context.Context, mediaID, sub string, w i
 		if err != nil {
 			return err
 		}
+		openStarted := perftrace.Begin(ctx)
 		f, err := os.Open(abs) // #nosec G304 -- abs is constrained to the media file directory with pathWithin.
+		perftrace.End(ctx, "subtitle.file.open", openStarted)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		body, err := io.ReadAll(f)
+		body, err := io.ReadAll(perftrace.Reader(ctx, f))
 		if err != nil {
 			return err
 		}
+		writeStarted := perftrace.Begin(ctx)
 		_, err = io.WriteString(w, decodeSubtitleText(body))
+		perftrace.End(ctx, "subtitle.write", writeStarted)
 		return err
 	default:
 		return errors.New("subtitle is not ASS/SSA")
@@ -553,6 +595,8 @@ func readExternalSubtitlePath(m *model.Media, sub string) (string, error) {
 }
 
 func (s *SubtitleService) serveEmbeddedASS(ctx context.Context, media *model.Media, streamIndex int, w io.Writer) error {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "subtitle.extract.ass", started)
 	input, err := s.resolveInput(ctx, media)
 	if err != nil {
 		return err

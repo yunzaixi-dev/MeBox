@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // Emby 远程挂载类型（service 层聚合走 EmbyRemoteService，不走 STRM 同步）。
@@ -72,7 +74,16 @@ func (t *embyUATransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
 		req.Header.Set("User-Agent", defaultUA)
 	}
-	return t.base.RoundTrip(req)
+	req = perftrace.Request(req)
+	started := perftrace.Begin(req.Context())
+	resp, err := t.base.RoundTrip(req)
+	perftrace.End(req.Context(), "upstream.headers", started)
+	if err != nil {
+		perftrace.Count(req.Context(), "upstream.request_error")
+	} else if resp != nil && resp.Body != nil {
+		resp.Body = perftrace.Body(req, resp.Body)
+	}
+	return resp, err
 }
 
 // embyBase normalizes the address so requests go to /emby/... endpoints.

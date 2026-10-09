@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/repository"
 )
 
@@ -42,7 +43,12 @@ func MediaSTRMTarget(m *model.Media) string {
 }
 
 func (s *StreamService) ServeFileWithCloudMode(w http.ResponseWriter, r *http.Request, mediaID, cloudMode string) error {
+	ctx := r.Context()
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "stream.file", started)
+	lookupStarted := perftrace.Begin(ctx)
 	m, err := s.repo.Media.FindByID(r.Context(), mediaID)
+	perftrace.End(ctx, "stream.file.lookup", lookupStarted)
 	if err != nil {
 		return err
 	}
@@ -80,19 +86,27 @@ func (s *StreamService) ServeFileWithCloudMode(w http.ResponseWriter, r *http.Re
 		// 502 + 原因，方便用户在播放器/日志里定位。
 		return ErrCloudPlaybackUnavailable
 	}
+	openStarted := perftrace.Begin(ctx)
 	f, err := os.Open(m.Path)
+	perftrace.End(ctx, "stream.file.open", openStarted)
 	if err != nil {
+		perftrace.Count(ctx, "stream.file.open.error")
 		return ErrMediaNotFound
 	}
 	defer f.Close()
+	statStarted := perftrace.Begin(ctx)
 	stat, err := f.Stat()
+	perftrace.End(ctx, "stream.file.stat", statStarted)
 	if err != nil {
+		perftrace.Count(ctx, "stream.file.stat.error")
 		return err
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(w, r, stat.Name(), stat.ModTime(), f)
+	transferStarted := perftrace.Begin(ctx)
+	http.ServeContent(w, r, stat.Name(), stat.ModTime(), perftrace.Reader(ctx, f))
+	perftrace.End(ctx, "stream.file.serve_content", transferStarted)
 	return nil
 }
 

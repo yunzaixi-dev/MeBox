@@ -14,6 +14,7 @@ import (
 
 	"github.com/truewhile/MeBox/internal/config"
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/repository"
 )
 
@@ -451,5 +452,77 @@ func TestAppendQueryToHLSSegments(t *testing.T) {
 	}
 	if !strings.Contains(got, "seg_00001.ts?old=1") {
 		t.Fatalf("existing query should be preserved: %q", got)
+	}
+}
+
+func TestLocalStreamRangePerformanceTrace(t *testing.T) {
+	repo := newStreamTestRepo(t)
+	path := filepath.Join(t.TempDir(), "movie.mp4")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	media := model.Media{Path: path, Container: "mp4"}
+	if err := repo.DB.Create(&media).Error; err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Cache.CacheDir = t.TempDir()
+	transcoder := NewTranscoderService(cfg, zap.NewNop(), repo, nil)
+	stream := NewStreamService(cfg, zap.NewNop(), repo, transcoder)
+	if err := os.MkdirAll(transcoder.HLSDir(media.ID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(transcoder.HLSDir(media.ID), "seg_00000.ts"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"direct", "segment"} {
+		for _, enabled := range []bool{false, true} {
+			name := mode + "/disabled"
+			if enabled {
+				name = mode + "/enabled"
+			}
+			t.Run(name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+				req.Header.Set("Range", "bytes=2-5")
+				var trace *perftrace.Trace
+				if enabled {
+					ctx, created := perftrace.New(req.Context())
+					trace = created
+					req = req.WithContext(ctx)
+				}
+				rec := httptest.NewRecorder()
+				var err error
+				if mode == "direct" {
+					err = stream.ServeFile(rec, req, media.ID)
+				} else {
+					err = stream.ServeHLSSegment(rec, req, media.ID, "seg_00000.ts")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rec.Code != http.StatusPartialContent || rec.Body.String() != "2345" || rec.Header().Get("Content-Range") != "bytes 2-5/10" {
+					t.Fatalf("range response: status=%d body=%q range=%q", rec.Code, rec.Body.String(), rec.Header().Get("Content-Range"))
+				}
+				if !enabled {
+					return
+				}
+				metrics := make(map[string]perftrace.Metric)
+				for _, metric := range trace.Finish().Metrics {
+					metrics[metric.Name] = metric
+				}
+				stages := []string{"stream.file.lookup", "stream.file.open", "stream.file.stat", "stream.file.serve_content"}
+				if mode == "segment" {
+					stages = []string{"hls.segment.open", "hls.segment.stat", "hls.segment.transfer"}
+				}
+				for _, stage := range stages {
+					if metrics[stage].Count != 1 {
+						t.Fatalf("stage %s count=%d, want 1", stage, metrics[stage].Count)
+					}
+				}
+				if metrics["stream.read"].Bytes != 4 || metrics["stream.seek"].Count == 0 {
+					t.Fatalf("range IO metrics: read=%+v seek=%+v", metrics["stream.read"], metrics["stream.seek"])
+				}
+			})
+		}
 	}
 }

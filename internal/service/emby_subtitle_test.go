@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/truewhile/MeBox/internal/config"
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // writeTempVideoWithSubtitle creates a temp directory with a fake video and a
@@ -80,8 +82,7 @@ func TestEmbyMediaStreamsAttachSameNameSubtitle(t *testing.T) {
 	if sub["Index"] != 2 {
 		t.Fatalf("subtitle index = %v, want 2", sub["Index"])
 	}
-	// Source codec (ASS) must be reported, and IsDefault must be false to match
-	// the official Emby external-subtitle contract.
+	// An untagged sidecar is not automatically selected.
 	if sub["Codec"] != "ass" {
 		t.Fatalf("subtitle codec = %v, want ass", sub["Codec"])
 	}
@@ -141,17 +142,34 @@ func TestEmbyServeSubtitleStreamServesRawSource(t *testing.T) {
 	}
 	mediaID := writeTempVideoWithSubtitle(t, svc, &lib, ".mp4", ".ass")
 	svc.SetSubtitleService(newTestSubtitleService(t, svc))
+	ctx, trace := perftrace.New(t.Context())
+	tracks, err := svc.subtitle.DiscoverExternalOnly(ctx, mediaID)
+	if err != nil || len(tracks) != 1 {
+		t.Fatalf("discover subtitle: tracks=%v err=%v", tracks, err)
+	}
+	want, err := os.ReadFile(tracks[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var buf bytes.Buffer
-	if err := svc.ServeSubtitleStream(t.Context(), &buf, mediaID, "2", ""); err != nil {
+	if err := svc.ServeSubtitleStream(ctx, &buf, mediaID, "2", ""); err != nil {
 		t.Fatalf("serve subtitle: %v", err)
 	}
-	// Emby must get the RAW ASS source, NOT a WebVTT conversion.
-	if bytes.Contains(buf.Bytes(), []byte("WEBVTT")) {
-		t.Fatalf("served subtitle should be raw ASS, got WebVTT: %q", buf.String())
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("raw subtitle changed: got %q want %q", buf.Bytes(), want)
 	}
-	if !bytes.Contains(buf.Bytes(), []byte("Dialogue:")) {
-		t.Fatalf("served subtitle should contain raw ASS Dialogue lines: %q", buf.String())
+	metrics := make(map[string]perftrace.Metric)
+	for _, metric := range trace.Finish().Metrics {
+		metrics[metric.Name] = metric
+	}
+	for _, stage := range []string{"subtitle.cache.miss", "subtitle.cache.hit", "subtitle.files.scan", "subtitle.serve.raw", "subtitle.file.open", "subtitle.transfer"} {
+		if metrics[stage].Count != 1 {
+			t.Fatalf("stage %s count=%d, want 1", stage, metrics[stage].Count)
+		}
+	}
+	if metrics["subtitle.files.read_dir"].Count != 5 || metrics["stream.read"].Bytes != int64(len(want)) {
+		t.Fatalf("subtitle IO metrics: read_dir=%+v read=%+v", metrics["subtitle.files.read_dir"], metrics["stream.read"])
 	}
 }
 
@@ -186,5 +204,127 @@ func TestEmbyMediaStreamsNoSubtitleServiceKeepsVideoAudio(t *testing.T) {
 	streams := svc.mediaStreams(t.Context(), m)
 	if len(streams) != 2 {
 		t.Fatalf("expected 2 streams (video/audio) without subtitle service, got %d: %#v", len(streams), streams)
+	}
+}
+
+func TestEmbySubtitlePlaybackPreferences(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		audio       string
+		suffixes    []string // Expected discovery order, including stable ties.
+		wantDefault bool
+	}{
+		{"mixed", "aac", []string{"chs.ass", "zh_CN.srt", "chi.vtt", "zh.ssa", "zh_Hant.srt", "en.srt"}, true},
+		{"without_audio", "", []string{"chs.srt", "cht.srt"}, true},
+		{"generic_chinese", "aac", []string{"zh.srt", "cht.srt"}, true},
+		{"traditional_only", "aac", []string{"zh_Hant.srt"}, false},
+		{"other_only", "", []string{"en.srt"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestEmbyService(t)
+			dir := t.TempDir()
+			lib := model.Library{Name: "电影", Path: dir, Type: "movie", Enabled: true}
+			if err := svc.repo.Library.Create(t.Context(), &lib); err != nil {
+				t.Fatal(err)
+			}
+			m := model.Media{LibraryID: lib.ID, Title: "MovieName", Path: filepath.Join(dir, "MovieName.mkv"), VideoCodec: "h264", AudioCodec: tc.audio}
+			if err := svc.repo.DB.Create(&m).Error; err != nil {
+				t.Fatal(err)
+			}
+			for _, suffix := range tc.suffixes {
+				if err := os.WriteFile(filepath.Join(dir, "MovieName."+suffix), []byte(suffix), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			subtitle := newTestSubtitleService(t, svc)
+			svc.SetSubtitleService(subtitle)
+			tracks, err := subtitle.DiscoverExternalOnly(t.Context(), m.ID)
+			if err != nil || len(tracks) != len(tc.suffixes) {
+				t.Fatalf("discovery = %#v, err = %v", tracks, err)
+			}
+			out, err := svc.PlaybackInfo(t.Context(), m.ID, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sources := out["MediaSources"].([]map[string]any)
+			if len(sources) != 1 {
+				t.Fatalf("media sources = %#v", sources)
+			}
+			source := sources[0]
+			streams := source["MediaStreams"].([]map[string]any)
+			first := 1
+			if tc.audio != "" {
+				first = 2
+			}
+			if len(streams) != first+len(tracks) {
+				t.Fatalf("media streams = %#v", streams)
+			}
+			defaultIndex, hasDefault := source["DefaultSubtitleStreamIndex"]
+			if hasDefault != tc.wantDefault || (hasDefault && defaultIndex != first) {
+				t.Fatalf("default subtitle index = %v, present = %v", defaultIndex, hasDefault)
+			}
+			for i, suffix := range tc.suffixes {
+				track, stream := tracks[i], streams[first+i]
+				path := filepath.Join(dir, "MovieName."+suffix)
+				lang := strings.ToLower(strings.TrimSuffix(suffix, filepath.Ext(suffix)))
+				language, label := "chi", "简体中文"
+				switch lang {
+				case "cht", "zh_hant":
+					label = "繁體中文"
+				case "en":
+					language, label = "eng", "English"
+				}
+				if track.Path != path || track.Lang != lang || track.Label != label {
+					t.Fatalf("discovered track[%d] = %#v, want %s (%s)", i, track, path, label)
+				}
+				index := first + i
+				if stream["Index"] != index || stream["Type"] != "Subtitle" || stream["Path"] != path || stream["Language"] != language || stream["DisplayTitle"] != label {
+					t.Fatalf("subtitle stream[%d] = %#v", i, stream)
+				}
+				if stream["IsDefault"] != (tc.wantDefault && i == 0) {
+					t.Fatalf("subtitle IsDefault = %v for %s", stream["IsDefault"], suffix)
+				}
+				codec := strings.TrimPrefix(filepath.Ext(suffix), ".")
+				if codec == "srt" {
+					codec = "subrip"
+				}
+				wantURL := "/Videos/" + m.ID + "/" + m.ID + "/Subtitles/" + strconv.Itoa(index) + "/Stream." + codec
+				if stream["DeliveryUrl"] != wantURL || stream["Codec"] != codec {
+					t.Fatalf("subtitle delivery = %#v, want %s", stream, wantURL)
+				}
+				var body bytes.Buffer
+				if err := svc.ServeSubtitleStream(t.Context(), &body, m.ID, strconv.Itoa(index), ""); err != nil {
+					t.Fatal(err)
+				}
+				if body.String() != suffix {
+					t.Fatalf("subtitle index %d served %q, want %q", index, body.String(), suffix)
+				}
+			}
+		})
+	}
+}
+
+func TestEmbyUserSubtitleConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, language, mode, wantLanguage, wantMode string
+	}{
+		{"defaults", "", "", "chi", "Always"},
+		{"whitespace", "  ", "  ", "chi", "Always"},
+		{"overrides", " eng ", " Default ", "eng", "Default"},
+		{"empty_language", " - ", " None ", "", "None"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MEBOX_EMBY_SUBTITLE_LANGUAGE", tc.language)
+			t.Setenv("MEBOX_EMBY_SUBTITLE_MODE", tc.mode)
+			svc := &EmbyService{}
+			user := &model.User{Username: "viewer", SubtitleChineseMode: "traditional"}
+			configuration := svc.userPayload(user)["Configuration"].(map[string]any)
+			if configuration["SubtitleLanguagePreference"] != tc.wantLanguage || configuration["SubtitleMode"] != tc.wantMode {
+				t.Fatalf("subtitle configuration = %#v", configuration)
+			}
+			if user.SubtitleChineseMode != "traditional" {
+				t.Fatal("Emby configuration changed the user's web subtitle preference")
+			}
+		})
 	}
 }

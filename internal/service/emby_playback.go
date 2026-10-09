@@ -12,12 +12,15 @@ import (
 	"time"
 
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // PlaybackInfo returns a PlaybackInfoResponse usable by Emby clients.
 // 远程 Emby 条目直接转发远程 PlaybackInfo，并按账号 proxy_play 配置决定
 // 播放地址指向远程（直连）还是 MeBox 本地代理端点。
 func (e *EmbyService) PlaybackInfo(ctx context.Context, mediaID, userID string) (map[string]any, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.info", started)
 	if e.remote != nil && IsEmbyRemoteID(mediaID) {
 		mountID, remoteID, _ := DecodeEmbyRemoteID(mediaID)
 		mount, acct, err := e.remote.ResolveMount(ctx, mountID)
@@ -263,6 +266,8 @@ func (e *EmbyService) directPlayOnly(ctx context.Context) bool {
 }
 
 func (e *EmbyService) playableMedia(ctx context.Context, id, userID string) (*model.Media, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.playable.lookup", started)
 	if season, ok, err := e.findSeasonGroup(ctx, id, userID); err != nil {
 		return nil, err
 	} else if ok && len(season.Episodes) > 0 {
@@ -289,6 +294,8 @@ func (e *EmbyService) playableMedia(ctx context.Context, id, userID string) (*mo
 // 直链给搜索接口）。/PlaybackInfo 走 false 路径，URL 指向 Emby 兼容
 // /Videos/{id}/stream（客户端会继续携带 X-Emby-Token 或 append api_key）。
 func (e *EmbyService) mediaSource(ctx context.Context, m *model.Media, asEmbedded, directOnly bool) map[string]any {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.media_source.build", started)
 	container := embyMediaContainer(m)
 	isCloud := strings.TrimSpace(m.STRMURL) != ""
 	playURL := e.embyMediaPlayURL(ctx, m, container, isCloud)
@@ -319,7 +326,10 @@ func (e *EmbyService) mediaSource(ctx context.Context, m *model.Media, asEmbedde
 }
 
 func (e *EmbyService) baseMediaSource(ctx context.Context, m *model.Media, container string, isCloud bool, playURL string, directOnly bool) map[string]any {
-	return map[string]any{
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "playback.media_source.base", started)
+	streams := e.mediaStreams(ctx, m)
+	src := map[string]any{
 		"Id":                    m.ID,
 		"Name":                  MediaVersionLabel(*m),
 		"Path":                  embyMediaSourcePath(m),
@@ -336,8 +346,12 @@ func (e *EmbyService) baseMediaSource(ctx context.Context, m *model.Media, conta
 		"SupportsDirectPlay":    !isCloud || playURL != "",
 		"SupportsProbing":       true,
 		"RunTimeTicks":          int64(m.DurationSec) * 10_000_000,
-		"MediaStreams":          e.mediaStreams(ctx, m),
+		"MediaStreams":          streams,
 	}
+	if idx, ok := defaultEmbySubtitleIndex(streams); ok {
+		src["DefaultSubtitleStreamIndex"] = idx
+	}
+	return src
 }
 
 // embyMediaSourcePath keeps Emby's Path field as a source identity rather

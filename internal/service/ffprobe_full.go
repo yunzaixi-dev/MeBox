@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
 // ffprobeFullTimeout 是一次全量探测（含章节）的超时。远端直链实测 3～4 秒，
@@ -112,6 +114,8 @@ func (r *FullProbeResult) PayloadJSON() (string, error) {
 // 与 Probe 的区别：Probe 只取扫描需要的几个字段、对着媒体行的本地路径跑；
 // ProbeFull 接受调用方解析好的输入（远端直链 + 绑定请求头），并额外抓章节。
 func (f *FFprobeService) ProbeFull(ctx context.Context, input ProbeInput) (*FullProbeResult, error) {
+	started := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "ffprobe.full", started)
 	if f == nil || f.cfg == nil {
 		return nil, errors.New("ffprobe service nil")
 	}
@@ -143,8 +147,11 @@ func (f *FFprobeService) ProbeFull(ctx context.Context, input ProbeInput) (*Full
 		"-show_chapters",
 		source,
 	)
+	execStarted := perftrace.Begin(ctx)
 	out, err := exec.CommandContext(probeCtx, bin, args...).Output() // #nosec G204 -- bin is resolved by resolveLocalExecutable before execution.
+	perftrace.End(ctx, "ffprobe.full.execute", execStarted)
 	if err != nil {
+		perftrace.Count(ctx, "ffprobe.execute.error")
 		return nil, fmt.Errorf("ffprobe full: %w", err)
 	}
 	return parseFullProbeJSON(out)

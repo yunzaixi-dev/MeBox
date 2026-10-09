@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/service/cloud"
 )
 
@@ -34,6 +35,8 @@ type StrmPlayResult struct {
 
 // ResolvePlay 解析 strm 播放请求。
 func (s *StrmService) ResolvePlay(ctx context.Context, provider string, q url.Values) (*StrmPlayResult, error) {
+	start := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "strm.resolve", start)
 	switch provider {
 	case model.StrmProviderLocal:
 		return s.resolveLocalPlay(ctx, q.Get("path"))
@@ -47,6 +50,8 @@ func (s *StrmService) ResolvePlay(ctx context.Context, provider string, q url.Va
 }
 
 func (s *StrmService) resolveCloudPlay(ctx context.Context, provider string, q url.Values, refKey string) (*StrmPlayResult, error) {
+	start := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "strm.cloud_resolve", start)
 	acctID := q.Get("acct")
 	ref := q.Get(refKey)
 	if acctID == "" || ref == "" {
@@ -134,6 +139,8 @@ func (s *StrmService) ResolvePlayTarget(ctx context.Context, raw string) (*StrmP
 // StreamService.resolveDirectPlayTargetURL），此时必须带上播放器的 UA，才能拿到
 // 与 /api/strm/play 端点一致的、按 UA 分键缓存的那条直链。
 func (s *StrmService) ResolvePlayTargetWithUA(ctx context.Context, raw, userAgent string) (*StrmPlayResult, error) {
+	start := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "strm.resolve_target", start)
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, errors.New("空播放目标")

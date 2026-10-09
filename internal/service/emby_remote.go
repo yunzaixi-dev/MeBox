@@ -34,6 +34,7 @@ import (
 
 	"github.com/truewhile/MeBox/internal/config"
 	"github.com/truewhile/MeBox/internal/model"
+	"github.com/truewhile/MeBox/internal/perftrace"
 	"github.com/truewhile/MeBox/internal/repository"
 )
 
@@ -53,7 +54,16 @@ func (t *embyRemoteTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
 		req.Header.Set("User-Agent", embyRemoteUA)
 	}
-	return t.base.RoundTrip(req)
+	req = perftrace.Request(req)
+	start := perftrace.Begin(req.Context())
+	resp, err := t.base.RoundTrip(req)
+	perftrace.End(req.Context(), "upstream.headers", start)
+	if err != nil {
+		perftrace.Count(req.Context(), "upstream.request_error")
+	} else if resp != nil && resp.Body != nil {
+		resp.Body = perftrace.Body(req, resp.Body)
+	}
+	return resp, err
 }
 
 // EmbyRemoteConfig 是一个远程 Emby 账号的解密配置。
@@ -102,6 +112,8 @@ const embyRemoteConcurrencyLimit = 8
 
 // enterRemoteGate 取得一个远程请求名额，返回释放函数。未配置闸门时返回空操作。
 func (r *EmbyRemoteService) enterRemoteGate(ctx context.Context) (func(), error) {
+	start := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "remote.gate_wait", start)
 	if r == nil || r.remoteGate == nil {
 		return func() {}, nil
 	}
@@ -115,6 +127,8 @@ func (r *EmbyRemoteService) enterRemoteGate(ctx context.Context) (func(), error)
 
 // fetchRemoteBody 在并发闸门内发起请求并读完响应体，返回状态码与字节。
 func (r *EmbyRemoteService) fetchRemoteBody(ctx context.Context, req *http.Request, path string) (int, []byte, error) {
+	start := perftrace.Begin(ctx)
+	defer perftrace.End(ctx, "remote.fetch", start)
 	release, err := r.enterRemoteGate(ctx)
 	if err != nil {
 		return 0, nil, err
