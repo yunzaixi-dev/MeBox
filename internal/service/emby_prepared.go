@@ -153,10 +153,21 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 	if !hls && request.EnableDirectPlay != nil && !*request.EnableDirectPlay && request.EnableDirectStream != nil && !*request.EnableDirectStream {
 		return false
 	}
-	if request.SubtitleStreamIndex != nil && *request.SubtitleStreamIndex >= 0 {
+	subtitleIndex := -1
+	if request.SubtitleStreamIndex != nil {
+		subtitleIndex = *request.SubtitleStreamIndex
+	} else {
+		for _, stream := range streams {
+			if stream["Type"] == "Subtitle" && stream["IsDefault"] == true {
+				subtitleIndex, _ = stream["Index"].(int)
+				break
+			}
+		}
+	}
+	if subtitleIndex >= 0 {
 		compatible := false
 		for _, stream := range streams {
-			if stream["Type"] != "Subtitle" || stream["Index"] != *request.SubtitleStreamIndex || stream["IsExternal"] != true {
+			if stream["Type"] != "Subtitle" || stream["Index"] != subtitleIndex || stream["IsExternal"] != true {
 				continue
 			}
 			codec, _ := stream["Codec"].(string)

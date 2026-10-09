@@ -84,6 +84,16 @@ func TestEmbyPreparedHLSRequiresFragmentedMP4AndExternalSubtitleSupport(t *testi
 	if !preparedClientSupports(request, media, metadata, true, subtitles) {
 		t.Fatal("supported external subtitles prevented optimized playback")
 	}
+	request.SubtitleStreamIndex = nil
+	subtitles[0]["IsDefault"] = true
+	profile.SubtitleProfiles[0].Method = "Encode"
+	if preparedClientSupports(request, media, metadata, true, subtitles) {
+		t.Fatal("default Chinese subtitle was silently lost for a burn-in-only client")
+	}
+	request.SubtitleStreamIndex = new(-1)
+	if !preparedClientSupports(request, media, metadata, true, subtitles) {
+		t.Fatal("explicitly disabled subtitles prevented prebuilt playback")
+	}
 }
 
 func TestSessionDeviceProfileIsIsolatedPreservedAndExpires(t *testing.T) {

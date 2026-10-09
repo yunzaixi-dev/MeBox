@@ -136,7 +136,7 @@ Emby 播放源会将 ffprobe 的 `matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` 别
 fatal 错误回退原文件并保留位置，明确提示不会自动视频转码。逻辑 media ID、数据库身份与 history 不变；使用外挂／文本字幕，不烧录。
 Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同用户、同设备经 `/Sessions/Capabilities/Full` 上报的短期能力；GET／POST、根路由及 `/emby` 大小写兼容入口共用此协商，不按客户端名称分支。
 明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；只有原生 MP4 能力或明确选择原音轨 MP4 时，使用原 ID 下的 faststart copy-only MP4。音频转换在来源名称明确标记。
-未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。字幕需要客户端支持现有外挂交付，不自动烧录。
+未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。显式选择和自动默认的字幕都需要客户端支持现有外挂交付，不自动烧录；明确关闭字幕不阻止 prepared。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
 
 “原画”只保证视频不重编码：原视频经独立 copy-only MP4 规范化后，与 prepared 的逐包 SHA-256、数量、顺序一致；
@@ -175,7 +175,8 @@ rtk proxy python3 scripts/prepare_playback.py --source "$SOURCE_HOST" \
 该版本仅复制首条视频／首条音频（AAC／FLAC／AC3／EAC3），不重编码、不混音、不猜测 PCE 声道布局；其他音轨、章节、字幕与附件保留在原文件。优化 MP4 不复制章节，避免 muxer 自动生成未请求的数据轨。
 Native MP4 使用原生 `-copyts` 保留原始时间轴／负音频 preroll，不使用会截短部分源末视频 sample 的 `-start_at_zero`；HLS 既有归零与校验逻辑不变。
 验证 moov 在 mdat 前、非碎片化、逐包 payload／数量／顺序、配置、PTS／DTS／结束同步及源 fingerprint；任一严格门槛不满足就拒绝发布，原文件继续可选。复制相同压缩包不保证不同 demuxer 的首尾 trimming 完全相同。
-服务仅读取 `prepared-mp4/<原 ID>/source.json` 和 `stream.mp4`，受现有媒体权限与 scoped token 保护，支持标准 Range／HEAD／条件请求；私有 no-cache 与包代际 ETag 防止回滚误用旧缓存。不调用 runtime FFmpeg／ffprobe。
+服务仅读取 `prepared-mp4/<原 ID>/source.json` 和 `stream.mp4`，保留既有媒体可见性与播放 profile 权限，支持标准 Range／HEAD／条件请求；私有 no-cache 与包代际 ETag 防止回滚误用旧缓存。不调用 runtime FFmpeg／ffprobe。
+Emby 兼容入口要求访问 token，仍拒绝用途限定的外链 token；后者只能访问原有 `/api` 播放端点且绑定单片，不能借 prepared 获取账号 API 权限。
 
 已有目录会完整复核，返回 `status=unchanged` 而不重打；改变 `--segment-seconds` 也不会重建已有包。
 需要改参数时先在独立目录生成并验证，停止该片读取后再按授权维护流程替换；不要直接覆盖已发布缓存。
