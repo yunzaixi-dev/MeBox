@@ -23,8 +23,11 @@ func (s *StreamService) ServeHLSPlaylist(w http.ResponseWriter, r *http.Request,
 	ctx := r.Context()
 	started := perftrace.Begin(ctx)
 	defer perftrace.End(ctx, "hls.playlist", started)
-	// 「客户端直连解码」模式下宿主机不提供转码，HLS 一律拒绝，
-	// 迫使播放器走 direct play 本地解码。
+	if r.URL.Query().Get("quality") == "prepared" {
+		return s.servePreparedHLS(w, r, mediaID, "index.m3u8")
+	}
+	// Direct-only forbids live transcoding; validated prepared VOD above copies
+	// original video offline and does not start a host transcode.
 	if s.directPlayOnly(r.Context()) {
 		return ErrTranscodeDisabled
 	}
@@ -188,6 +191,9 @@ func (s *StreamService) ServeHLSSegment(w http.ResponseWriter, r *http.Request, 
 	ctx := r.Context()
 	started := perftrace.Begin(ctx)
 	defer perftrace.End(ctx, "hls.segment", started)
+	if r.URL.Query().Get("quality") == "prepared" {
+		return s.servePreparedHLS(w, r, mediaID, segment)
+	}
 	s.transcoder.TouchJob(mediaID)
 	// Only allow segments that look like seg_NNNNN.ts so we cannot be tricked
 	// into reading arbitrary files via path traversal.

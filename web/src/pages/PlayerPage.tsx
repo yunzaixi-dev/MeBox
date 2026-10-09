@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type Hls from 'hls.js'
+import HlsCtor from 'hls.js'
 import toast from 'react-hot-toast'
 
 import { mediaAPI, libraryAPI } from '../api/library'
@@ -64,10 +64,10 @@ import {
 // 播放模式不再写回 URL——写 URL 会让 search 变化触发依赖 setSearchParams 的 effect
 // 重跑，把刚切好的 HLS 打回直连（表现为「切了 HLS 还是直连播放」）。
 //
-// We pick a sensible default based on the source codec: H.264 + AAC in
-// MP4 / WebM containers play directly; everything else (HEVC, MKV, AV1,
-// AC3 audio, …) gets routed through ffmpeg → HLS. STRM / 云盘直链默认直连，
-// 浏览器播不了时再切 HLS。远程 Emby 挂载只能直连。
+// Supported local non-VR prepared HLS takes priority: original video, with AAC
+// compatibility audio explicitly labelled when needed. It uses a full VOD timeline,
+// never a live transcode seek/restart. Forced direct and other quality choices win.
+// Unprepared sources retain codec-based direct/HLS selection and cloud fallback.
 //
 // External subtitles next to the source file are auto-discovered and
 // attached as <track> elements.
@@ -106,7 +106,7 @@ export function PlayerPage() {
   const location = useLocation()
 
   const ref = useRef<HTMLVideoElement>(null)
-  const hlsRef = useRef<Hls | null>(null)
+  const hlsRef = useRef<HlsCtor | null>(null)
   const lastSentRef = useRef(0)
   const progressSessionRef = useRef<PlaybackProgressSession | null>(null)
   const directRetryRef = useRef(false)
@@ -168,7 +168,7 @@ export function PlayerPage() {
   const [playerError, setPlayerError] = useState('')
   // 媒体元数据加载失败（404 / 无权限等）：舞台区直接展示错误而不是永远「加载中」
   const [loadError, setLoadError] = useState('')
-  // 「客户端直连解码」模式：宿主机不转码，播放器强制 direct play、隐藏 HLS 切换。
+  // 「客户端直连解码」禁用实时转码，但仍允许已准备好的原画 VOD。
   const [directOnly, setDirectOnly] = useState(false)
   const [directOnlyKnown, setDirectOnlyKnown] = useState(false)
   const [resumePosition, setResumePosition] = useState(0)
@@ -177,8 +177,15 @@ export function PlayerPage() {
   const [hlsStartSec, setHlsStartSec] = useState(0)
   // 统一播放能力：115 提供 direct → cloud_hls → local_hls，其它源 direct → local_hls。
   const [playbackInfo, setPlaybackInfo] = useState<PlaybackInfo | null>(null)
-  const [hlsSource, setHlsSource] = useState<'cloud' | 'local'>('local')
+  const [hlsSource, setHlsSource] = useState<'cloud' | 'local' | 'prepared'>('local')
   const [selectedQuality, setSelectedQuality] = useState('')
+  const [preparedSupported, setPreparedSupported] = useState(false)
+  const [capabilityReadyId, setCapabilityReadyId] = useState('')
+  const [capabilityTimedOut, setCapabilityTimedOut] = useState(false)
+  const [startupReadyId, setStartupReadyId] = useState('')
+  const preparedFailedRef = useRef(false)
+  const playbackChoiceTouchedRef = useRef(false)
+  const preparedPlayback = mode === 'hls' && hlsSource === 'prepared'
   const [cloudWaiting, setCloudWaiting] = useState(false)
   const [cloudWaitMessage, setCloudWaitMessage] = useState('')
   const [cloudWaitStartedAt, setCloudWaitStartedAt] = useState(0)
@@ -237,7 +244,7 @@ export function PlayerPage() {
     navigate(backTarget(), { replace: true })
   }, [backTarget, navigate])
 
-  // 读取宿主机的「直连解码」开关。开启时全程 direct play，不走 HLS。
+  // 读取宿主机的「直连解码」开关；已准备好的原画 VOD 不启动转码。
   useEffect(() => {
     systemAPI
       .info()
@@ -482,6 +489,12 @@ export function PlayerPage() {
     setVr360Detected(false)
     setHlsStartSec(0)
     setPlaybackInfo(null)
+    setPreparedSupported(false)
+    setCapabilityReadyId('')
+    setCapabilityTimedOut(false)
+    setStartupReadyId('')
+    preparedFailedRef.current = false
+    playbackChoiceTouchedRef.current = false
     setHlsSource('local')
     setSelectedQuality('')
     setCloudWaiting(false)
@@ -526,6 +539,7 @@ export function PlayerPage() {
   const setPlaybackMode = useCallback((next: PlayerMode) => {
     // 一旦显式决定过播放方式，URL 上的 ?mode= 就不再是权威（避免它把状态打回去）。
     requestedModeRef.current = null
+    initialHlsRequestRef.current = false
     setMode(next)
   }, [])
 
@@ -715,7 +729,7 @@ export function PlayerPage() {
     [playbackInfo, selectedQuality, setPlaybackMode],
   )
 
-  // Load metadata and pick a default mode.
+  // Load metadata; capability selection below decides the initial source.
   useEffect(() => {
     if (!id) return
     let cancelled = false
@@ -726,21 +740,7 @@ export function PlayerPage() {
         setMedia(m)
         setPlayerError('')
         setLoadError('')
-        const isDirect = isDirectStreamMedia(m)
-        const auto = pickPlayerMode(m)
-        // 直连解码 / 远程 Emby：强制直连。
-        if (directOnly || isDirect) {
-          setMode('direct')
-          return
-        }
-        // URL 上带 ?mode= 时以它为准（详情页「HLS 兼容转码播放」入口）；
-        // 否则按片源自动判定，但不要用滞后的 get 回调把用户手动切的 HLS 盖回直连。
-        const requested = requestedModeRef.current
-        if (requested) {
-          setMode(requested)
-          return
-        }
-        setMode((prev) => (prev === 'hls' ? prev : auto))
+        // Playback capability selection below owns the initial mode, before any src request.
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -750,7 +750,7 @@ export function PlayerPage() {
     return () => {
       cancelled = true
     }
-  }, [id, directOnly])
+  }, [id])
 
   // VR 全景素材识别：只在用户没手动改过开关时自动进入 VR 模式。
   // 识别完全基于文件名/路径关键词与画幅比例，误判时点一下 VR 按钮即可退出。
@@ -855,28 +855,80 @@ export function PlayerPage() {
     setPlayerPlaybackRate(DEFAULT_PLAYBACK_RATE)
   }, [mediaId])
 
-  // 加载统一播放能力：115 云端清晰度 + 本地 HLS 清晰度。
+  // Decide once before assigning src. A slow capability request must not stall playback forever.
   useEffect(() => {
-    if (!mediaId) return
+    if (!mediaId || mediaId !== id) return
     let cancelled = false
-    mediaAPI
-      .playbackInfo(mediaId)
-      .then((info) => {
-        if (cancelled) return
-        setPlaybackInfo(info)
-        cloudRetryRef.current = Math.max(3, info.transcode.retry_after_sec || 5)
-        setSelectedQuality((prev) => {
-          if (prev && findPlaybackQualityById(info, prev)) return prev
-          return info.default_quality || info.local_qualities?.[0]?.id || ''
-        })
-      })
-      .catch(() => {
-        if (!cancelled) setPlaybackInfo(null)
-      })
+    let settled = false
+    const timer = setTimeout(() => {
+      if (cancelled) return
+      setCapabilityTimedOut(true)
+      if (!settled) {
+        settled = true
+        setCapabilityReadyId(mediaId)
+      }
+    }, 5000)
+    void mediaAPI.playbackInfo(mediaId).then((info) => {
+      let supported = false
+      if (info.prepared_hls?.codecs && !isStrmMedia(mediaRef.current) && !isDirectStreamMedia(mediaRef.current)) {
+        try {
+          supported = HlsCtor.isSupported() && typeof MediaSource !== 'undefined' &&
+            MediaSource.isTypeSupported(`video/mp4; codecs="${info.prepared_hls.codecs}"`)
+        } catch {
+          supported = false
+        }
+      }
+      if (cancelled || settled) return
+      settled = true
+      setPlaybackInfo(info)
+      setPreparedSupported(supported)
+      setCapabilityReadyId(mediaId)
+      cloudRetryRef.current = Math.max(3, info.transcode.retry_after_sec || 5)
+      setSelectedQuality(info.default_quality || info.local_qualities?.[0]?.id || '')
+    }).catch(() => {
+      if (cancelled || settled) return
+      settled = true
+      setCapabilityReadyId(mediaId)
+    })
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
-  }, [mediaId])
+  }, [id, mediaId])
+
+  useEffect(() => {
+    if (!media || media.id !== id || capabilityReadyId !== media.id || startupReadyId === media.id) return
+    if (!directOnlyKnown && !capabilityTimedOut) return
+    const requestedQuality = new URLSearchParams(window.location.search).get('quality')
+    const requested = requestedModeRef.current
+    const quality = requestedQuality && requestedQuality !== 'prepared'
+      ? findPlaybackQualityById(playbackInfo, requestedQuality) : undefined
+    if (!playbackChoiceTouchedRef.current && preparedSupported && !vr360 &&
+        requested !== 'direct' && (!requestedQuality || requestedQuality === 'prepared')) {
+      setSelectedQuality('prepared')
+      setHlsSource('prepared')
+      setHlsStartSec(0)
+      setMode('hls')
+      initialHlsRequestRef.current = false
+    } else if (!playbackChoiceTouchedRef.current) {
+      if (quality && !directOnly && quality.available && quality.source !== 'original' && requested !== 'direct') {
+        setSelectedQuality(quality.id)
+        setHlsSource(quality.source === 'cloud' ? 'cloud' : 'local')
+        setMode('hls')
+        initialHlsRequestRef.current = false
+      } else {
+        setMode(directOnly || !directOnlyKnown || isDirectStreamMedia(media) || quality?.source === 'original' ||
+          (playbackInfo?.prepared_hls && (!preparedSupported || vr360))
+          ? 'direct' : requested ?? pickPlayerMode(media))
+      }
+    }
+    if (playbackInfo?.prepared_hls && (!preparedSupported || vr360) &&
+        (!requestedQuality || requestedQuality === 'prepared')) {
+      initialHlsRequestRef.current = false
+    }
+    setStartupReadyId(media.id)
+  }, [capabilityReadyId, capabilityTimedOut, directOnly, directOnlyKnown, id, media,
+    playbackInfo, preparedSupported, startupReadyId, vr360])
 
   useEffect(() => {
     cloudRetryRef.current = Math.max(3, playbackInfo?.transcode.retry_after_sec || 5)
@@ -1057,18 +1109,19 @@ export function PlayerPage() {
   // 从 URL 强制 HLS（媒体详情页「HLS 兼容转码播放」）时，等播放能力返回后再选线路：
   // 115 有可用的云转码档位就走云 HLS，否则退回本地转码。只做一次。
   useEffect(() => {
-    if (!playbackInfo || !initialHlsRequestRef.current) return
+    if (!playbackInfo || !initialHlsRequestRef.current || startupReadyId !== mediaId) return
     if (directOnly || !mediaId) return
     initialHlsRequestRef.current = false
     enterHlsPlayback(0, playbackInfo)
-  }, [directOnly, enterHlsPlayback, mediaId, playbackInfo])
+  }, [directOnly, enterHlsPlayback, mediaId, playbackInfo, startupReadyId])
 
-  // 直连播放只发现外挂字幕；只有 HLS 模式需要探测可烧录的内嵌字幕。
+  // Prepared original-video VOD uses external/text subtitles, never FFmpeg burning.
+  const discoverBurnSubtitles = mode === 'hls' && !preparedPlayback
   useEffect(() => {
     if (!mediaId) return
     let cancelled = false
     subtitlesAPI
-      .list(mediaId, mode === 'hls')
+      .list(mediaId, discoverBurnSubtitles)
       .then((tracks) => {
         if (cancelled) return
         const list = tracks ?? []
@@ -1084,7 +1137,7 @@ export function PlayerPage() {
     return () => {
       cancelled = true
     }
-  }, [mediaId, mode])
+  }, [mediaId, discoverBurnSubtitles])
 
   const selectedSubtitle = subtitleIndex >= 0 ? subs[subtitleIndex] : undefined
   const burnedSubtitleStream =
@@ -1092,20 +1145,41 @@ export function PlayerPage() {
   // 直连不使用烧录字幕参数。字幕列表通常比媒体信息晚返回，若把该参数直接
   // 作为播放 effect 的依赖，会在 STRM 的 302 直链仍在建立时重复设置 src，
   // Chromium 会把被中断的首次加载报告成播放错误并误触发 HLS 回退。
-  const activeBurnedSubtitleStream = mode === 'hls' ? burnedSubtitleStream : undefined
+  const activeBurnedSubtitleStream = mode === 'hls' && !preparedPlayback ? burnedSubtitleStream : undefined
   const mediaRef = useRef(media)
   useEffect(() => {
     mediaRef.current = media
   }, [media])
 
+  const fallbackPreparedToDirect = useCallback(() => {
+    if (preparedFailedRef.current) return
+    preparedFailedRef.current = true
+    pendingSeekRef.current = ref.current?.currentTime || null
+    clearFallbackTimer()
+    setCloudWaiting(false)
+    setHlsStartSec(0)
+    setPlayerError('原画 VOD 播放失败，已返回原始文件直连；不会自动转码视频。')
+    toast.error('原画 VOD 播放失败，返回原始文件直连')
+    setPlaybackMode('direct')
+  }, [clearFallbackTimer, setPlaybackMode])
+
+  // Turning on VR leaves prepared playback on the original file, without video conversion.
   useEffect(() => {
-    if (!mediaId || !ref.current) return
+    if (!vr360 || !preparedPlayback) return
+    pendingSeekRef.current = ref.current?.currentTime || null
+    setHlsStartSec(0)
+    setPlaybackMode('direct')
+  }, [preparedPlayback, setPlaybackMode, vr360])
+
+  useEffect(() => {
+    if (!mediaId || mediaId !== id || startupReadyId !== mediaId || !ref.current) return
     const currentMedia = mediaRef.current
     if (!currentMedia) return
     let cancelled = false
     teardownHls()
 
     const video = ref.current
+    let restoreDirectPosition: (() => void) | undefined
     const durationSec = currentMedia.duration_sec || 0
     if (mode === 'hls') {
       if (hlsSource === 'cloud' && cloudWaiting) {
@@ -1115,9 +1189,7 @@ export function PlayerPage() {
       const url =
         hlsSource === 'cloud'
           ? cloudHlsURL(mediaId, selectedQuality)
-          : hlsURL(mediaId, hlsStartSec, activeBurnedSubtitleStream, selectedQuality)
-      void import('hls.js').then(({ default: HlsCtor }) => {
-        if (cancelled || !ref.current) return
+          : hlsURL(mediaId, preparedPlayback ? 0 : hlsStartSec, activeBurnedSubtitleStream, selectedQuality)
         if (HlsCtor.isSupported()) {
           const hls = new HlsCtor({
             enableWorker: true,
@@ -1127,6 +1199,19 @@ export function PlayerPage() {
             // 10s default, which otherwise aborts a healthy transcode.
             manifestLoadingTimeOut: 60_000,
             manifestLoadingMaxRetry: 1,
+            ...(preparedPlayback ? {
+              maxBufferLength: 60,
+              maxMaxBufferLength: 60,
+              maxBufferSize: 64 * 1024 * 1024,
+              backBufferLength: 30,
+              xhrSetup: (xhr: XMLHttpRequest, assetURL: string) => {
+                const target = new URL(assetURL, window.location.href)
+                if (target.origin !== window.location.origin ||
+                    !target.pathname.startsWith(`/api/hls/${encodeURIComponent(mediaId)}/`)) return
+                const token = useAuthStore.getState().token
+                if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+              },
+            } : {}),
           })
           try {
             video.currentTime = 0
@@ -1136,6 +1221,7 @@ export function PlayerPage() {
           hls.loadSource(url)
           hls.attachMedia(video)
           hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+            if (cancelled) return
             if (pendingSeekRef.current !== null) {
               const target = pendingSeekRef.current
               pendingSeekRef.current = null
@@ -1157,7 +1243,12 @@ export function PlayerPage() {
               .catch(() => undefined)
           })
           hls.on(HlsCtor.Events.ERROR, (_, data) => {
+            if (cancelled) return
             if (data.fatal) {
+              if (preparedPlayback) {
+                fallbackPreparedToDirect()
+                return
+              }
               if (hlsSource === 'cloud') {
                 const position = ref.current?.currentTime || 0
                 setHlsUnavailable(false)
@@ -1176,12 +1267,8 @@ export function PlayerPage() {
               setPlaybackMode('direct')
             }
           })
-          if (cancelled) {
-            hls.destroy()
-            return
-          }
           hlsRef.current = hls
-        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        } else if (!preparedPlayback && video.canPlayType('application/vnd.apple.mpegurl')) {
           try {
             video.currentTime = 0
           } catch {
@@ -1190,17 +1277,15 @@ export function PlayerPage() {
           video.src = url
           void video.play().catch(() => undefined)
         } else {
+          if (preparedPlayback) {
+            fallbackPreparedToDirect()
+            return
+          }
           setHlsUnavailable(true)
           setPlayerError('当前浏览器不支持 HLS，正在尝试直接播放。')
           toast.error('当前浏览器不支持 HLS，降级到直接播放')
           setPlaybackMode('direct')
         }
-      }).catch(() => {
-        if (cancelled) return
-        setHlsUnavailable(true)
-        setPlayerError('HLS 播放组件加载失败，正在尝试直接播放。')
-        setPlaybackMode('direct')
-      })
     } else {
       // VR 全景需要浏览器能读帧：STRM/网盘直链会被 302 到跨域 CDN，此时改为
       // 服务端同源转发（原画，不转码）；普通播放仍走 302 直连，省服务器流量。
@@ -1212,24 +1297,23 @@ export function PlayerPage() {
         directRetryRef.current = false
         clearFallbackTimer()
         // 进出 VR 会切换播放源地址，这里保住当前播放位置。
-        const resumeAt = video.currentTime > 2 ? video.currentTime : 0
+        const resumeAt = pendingSeekRef.current ?? (video.currentTime > 2 ? video.currentTime : 0)
+        pendingSeekRef.current = null
         if (resumeAt > 0) {
-          video.addEventListener(
-            'loadedmetadata',
-            () => {
-              try {
-                video.currentTime = resumeAt
-              } catch {
-                // ignore
-              }
-            },
-            { once: true },
-          )
+          restoreDirectPosition = () => {
+            if (cancelled) return
+            try {
+              video.currentTime = resumeAt
+            } catch {
+              // ignore
+            }
+          }
+          video.addEventListener('loadedmetadata', restoreDirectPosition, { once: true })
         }
         video.src = url
         void video.play().catch(() => undefined)
       }
-      if (hlsUnavailable && needsTranscodeForBrowser(currentMedia)) {
+      if (!preparedFailedRef.current && hlsUnavailable && needsTranscodeForBrowser(currentMedia)) {
         setPlayerError('当前正在直连播放原始文件；此封装或音轨浏览器兼容性有限，可能只有画面没有声音。请配置本机 ffmpeg 后切回 HLS 转码播放。')
       }
     }
@@ -1237,6 +1321,7 @@ export function PlayerPage() {
     video.addEventListener('playing', onPlaying)
     return () => {
       cancelled = true
+      if (restoreDirectPosition) video.removeEventListener('loadedmetadata', restoreDirectPosition)
       video.removeEventListener('playing', onPlaying)
       teardownHls()
     }
@@ -1244,14 +1329,18 @@ export function PlayerPage() {
     activeBurnedSubtitleStream,
     clearFallbackTimer,
     cloudWaiting,
+    fallbackPreparedToDirect,
     hlsSource,
     hlsUnavailable,
     hlsStartSec,
+    id,
     mediaId,
     mode,
     playbackProvider,
+    preparedPlayback,
     selectedQuality,
     setPlaybackMode,
+    startupReadyId,
     switchToLocalHLS,
     teardownHls,
     vr360DirectProxy,
@@ -1278,21 +1367,24 @@ export function PlayerPage() {
   // 自动拉取已有的播放进度并恢复播放位置
   useEffect(() => {
     if (!id) return
+    let cancelled = false
     setResumePosition(0)
     setInitialSeekDone(false)
     playbackAPI
       .getResume(id)
       .then((progress) => {
+        if (cancelled) return
         if (progress.position_ms > 2000 && !progress.completed) {
           setResumePosition(progress.position_ms / 1000)
         }
       })
       .catch(() => undefined)
+    return () => { cancelled = true }
   }, [id])
 
   useEffect(() => {
-    if (!resumePosition || initialSeekDone) return
-    if (mode === 'hls') {
+    if (!resumePosition || initialSeekDone || startupReadyId !== mediaId) return
+    if (mode === 'hls' && !preparedPlayback) {
       // Restart transcode near the resume point instead of seeking a short partial playlist.
       if (Math.abs(hlsStartSec - resumePosition) > 2) {
         setHlsStartSec(resumePosition)
@@ -1391,15 +1483,16 @@ export function PlayerPage() {
       if (onPlaying) video.removeEventListener('playing', onPlaying)
       if (onCanPlay) video.removeEventListener('canplay', onCanPlay)
     }
-  }, [resumePosition, initialSeekDone, mode, hlsStartSec, clearFallbackTimer, seekStrmDirectTo])
+  }, [resumePosition, initialSeekDone, mode, hlsStartSec, clearFallbackTimer, seekStrmDirectTo,
+    preparedPlayback, startupReadyId, mediaId])
 
   // 使用 ref 实时同步进度计算所需的状态，避免每次 hlsStartSec 改变都触发 cleanup 并误上报旧进度
   const hlsStartSecRef = useRef(hlsStartSec)
   const modeRef = useRef(mode)
   useEffect(() => {
-    hlsStartSecRef.current = hlsStartSec
+    hlsStartSecRef.current = preparedPlayback ? 0 : hlsStartSec
     modeRef.current = mode
-  }, [hlsStartSec, mode])
+  }, [hlsStartSec, mode, preparedPlayback])
 
   // Persist resume position every 10 seconds while playing, and immediately upon
   // pause/page hide/unmount. Bind after mediaId is available because
@@ -1704,23 +1797,40 @@ export function PlayerPage() {
   }, [goBack, prevEpisode, nextEpisode, handlePrevEpisode, handleNextEpisode, playlistOpen, danmakuOpen])
 
   const isDirectStream = isDirectStreamMedia(media)
-  const qualityOptions =
-    playbackInfo?.provider === 'cloud115'
-      ? [...(playbackInfo.cloud_qualities ?? []), ...(playbackInfo.local_qualities ?? [])]
-      : (playbackInfo?.local_qualities ?? [])
-  // 直连解码模式下宿主机不转码，档位选择没有意义（远程 Emby 挂载同理）：直接隐藏。
-  const showQuality = !directOnly && qualityOptions.length > 0
+  const preparedQuality: PlaybackQuality | undefined = preparedSupported && !vr360
+    ? {
+        id: 'prepared',
+        label: playbackInfo?.prepared_hls?.audio_transcoded
+          ? '原画 VOD · AAC 兼容音频' : '原画 VOD · 原始音频',
+        source: 'local',
+        available: true,
+      }
+    : undefined
+  const availableQualities = playbackInfo?.provider === 'cloud115'
+    ? [...(playbackInfo.cloud_qualities ?? []), ...(playbackInfo.local_qualities ?? [])]
+    : (playbackInfo?.local_qualities ?? [])
+  const qualityOptions = preparedQuality
+    ? [
+        preparedQuality,
+        ...(availableQualities.some((quality) => quality.source === 'original')
+          ? [] : [{ id: 'original', label: '原画直连', source: 'original' as const, available: true }]),
+        ...availableQualities.filter((quality) => !directOnly || quality.source === 'original'),
+      ]
+    : availableQualities
+  const showQuality = (!directOnly || Boolean(preparedQuality)) && qualityOptions.length > 0
   // 清晰度按钮上显示的文字。直接播放时按「原画」呈现，和档位列表里的原画项一致，
   // 避免出现「明明是原文件却显示 1080P」这种误导。
   const originalQualityLabel =
     qualityOptions.find((quality) => quality.source === 'original')?.label || '原画'
-  const selectedQualityLabel = findPlaybackQualityById(playbackInfo, selectedQuality)?.label || ''
+  const selectedQualityLabel = qualityOptions.find((quality) => quality.id === selectedQuality)?.label || ''
   const qualityLabel =
     mode === 'direct' ? originalQualityLabel : selectedQualityLabel || '清晰度'
   // 播放方式标签：直接说清「这条片子现在是怎么在播」，避免用户猜线路
   //（115 直链 / 115 云 HLS / 本地转码 / 客户端解码）。
-  const playbackModeLabel = isDirectStream
-    ? isRemoteEmbyID(media?.id)
+  const playbackModeLabel = preparedPlayback
+    ? preparedQuality?.label || '原画 VOD'
+    : isDirectStream
+      ? isRemoteEmbyID(media?.id)
       ? 'Emby 直连播放'
       : '直连播放'
     : directOnly
@@ -1778,6 +1888,7 @@ export function PlayerPage() {
   ])
 
   const toggleMode = useCallback(() => {
+    playbackChoiceTouchedRef.current = true
     if (isDirectStream) {
       toast('该媒体为直连播放，无需且不支持转码')
       return
@@ -1787,6 +1898,7 @@ export function PlayerPage() {
       // 带着当前位置切过去：云 HLS 跳一下、本地 HLS 从该点重开转码，都不从头播。
       enterHlsPlayback(ref.current?.currentTime || 0)
     } else {
+      pendingSeekRef.current = ref.current?.currentTime || null
       setCloudWaiting(false)
     }
     setPlaybackMode(next)
@@ -1966,6 +2078,10 @@ export function PlayerPage() {
   const selectSubtitle = useCallback((index: number) => {
     const oldTrack = subtitleIndex >= 0 ? subs[subtitleIndex] : undefined
     const nextTrack = index >= 0 ? subs[index] : undefined
+    if (nextTrack?.delivery === 'burn' && preparedPlayback) {
+      toast.error('原画 VOD 不烧录图片字幕；请选择外挂字幕，或明确切换到视频转码档位')
+      return
+    }
     if (nextTrack?.delivery === 'burn' && (directOnly || isDirectStream)) {
       toast.error('图片字幕需要开启 HLS 转码后才能显示')
       return
@@ -1976,7 +2092,7 @@ export function PlayerPage() {
     }
     const burnChanged =
       oldTrack?.delivery === 'burn' || nextTrack?.delivery === 'burn'
-    if (burnChanged && mode === 'hls' && ref.current) {
+    if (burnChanged && mode === 'hls' && !preparedPlayback && ref.current) {
       setHlsStartSec(hlsStartSec + (ref.current.currentTime || 0))
     }
     setSubtitleIndex(index)
@@ -1984,13 +2100,30 @@ export function PlayerPage() {
       setHlsStartSec(ref.current?.currentTime || 0)
       setPlaybackMode('hls')
     }
-  }, [directOnly, hlsStartSec, isDirectStream, mode, setPlaybackMode, subs, subtitleIndex, switchToLocalHLS])
+  }, [directOnly, hlsStartSec, isDirectStream, mode, preparedPlayback, setPlaybackMode, subs, subtitleIndex, switchToLocalHLS])
 
   const selectPlaybackQuality = useCallback(
     (quality: PlaybackQuality) => {
       const video = ref.current
-      const position = video?.currentTime || 0
+      const position = (mode === 'hls' && hlsSource === 'local' ? hlsStartSec : 0) + (video?.currentTime || 0)
+      playbackChoiceTouchedRef.current = true
+      preparedFailedRef.current = false
+      if (quality.id === 'prepared') {
+        if (!preparedSupported || vr360) {
+          toast.error('当前浏览器或 VR 模式不支持此原画 VOD')
+          return
+        }
+        setPlayerError('')
+        setSelectedQuality('prepared')
+        setHlsSource('prepared')
+        setCloudWaiting(false)
+        setHlsStartSec(0)
+        pendingSeekRef.current = position > 2 ? position : null
+        setPlaybackMode('hls')
+        return
+      }
       if (quality.source === 'original') {
+        pendingSeekRef.current = position > 2 ? position : null
         setCloudWaiting(false)
         setHlsSource('local')
         setPlaybackMode('direct')
@@ -2022,10 +2155,10 @@ export function PlayerPage() {
         toast.error(quality.note || '当前无法进行 HLS 转码，请在「系统设置 → 常规」安装 ffmpeg 后重试')
         return
       }
-      if (position > 2) setHlsStartSec(position)
+      setHlsStartSec(position)
       setPlaybackMode('hls')
     },
-    [setPlaybackMode, startCloudTranscode],
+    [hlsSource, hlsStartSec, mode, preparedSupported, setPlaybackMode, startCloudTranscode, vr360],
   )
 
   const changeSubtitleChineseMode = useCallback(
@@ -2054,6 +2187,10 @@ export function PlayerPage() {
 
   const handleVideoError = useCallback(() => {
     const video = ref.current
+    if (preparedPlayback) {
+      fallbackPreparedToDirect()
+      return
+    }
     if (mode !== 'direct') {
       setPlayerError('视频播放失败，请检查文件是否存在，或确认 ffmpeg 已正确配置。')
       toast.error('视频播放失败，请检查文件是否存在')
@@ -2102,6 +2239,13 @@ export function PlayerPage() {
       if (Date.now() < directSeekGraceUntilRef.current) return
       const current = ref.current
       if (current && current.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return
+      if (preparedFailedRef.current || requestedModeRef.current === 'direct' ||
+          (playbackChoiceTouchedRef.current && modeRef.current === 'direct') ||
+          (playbackInfo?.prepared_hls && !preparedSupported)) {
+        setPlayerError('原始文件直连播放失败；不会自动转码视频，请使用支持该编码的外部播放器。')
+        toast.error('原始文件直连播放失败，请使用外部播放器')
+        return
+      }
       if (isRemoteEmbyID(mediaRef.current?.id) || isDirectStreamMedia(mediaRef.current)) {
         setPlayerError('直接播放失败。该媒体为远程 Emby 挂载直连播放（不进行转码）；当前浏览器可能不支持该视频编码或音频格式，建议使用外部播放器（如 PotPlayer / VLC / IINA）播放。')
         toast.error('直接播放失败，建议使用外部播放器')
@@ -2139,6 +2283,9 @@ export function PlayerPage() {
     fallbackTimerRef.current = setTimeout(fallbackDirectPlay, fallbackDelayMs)
   }, [
     clearFallbackTimer,
+    fallbackPreparedToDirect,
+    preparedPlayback,
+    preparedSupported,
     directOnly,
     hlsUnavailable,
     mediaId,

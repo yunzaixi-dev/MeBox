@@ -42,6 +42,7 @@ type PlaybackInfo struct {
 	CloudQualities []PlaybackQuality      `json:"cloud_qualities,omitempty"`
 	LocalQualities []PlaybackQuality      `json:"local_qualities"`
 	Transcode      Cloud115TranscodeState `json:"transcode"`
+	PreparedHLS    *preparedHLSInfo       `json:"prepared_hls,omitempty"`
 }
 
 type cloud115PushAttempt struct {
@@ -129,6 +130,9 @@ func (s *Cloud115PlaybackService) PlaybackInfo(ctx context.Context, mediaID stri
 		DefaultQuality: localDefault,
 		LocalQualities: localQualities,
 		Transcode:      Cloud115TranscodeState{State: "idle"},
+	}
+	if prepared, _, err := preparedHLS(s.cfg, m); err == nil {
+		info.PreparedHLS = &prepared.preparedHLSInfo
 	}
 	if provider != model.StrmProvider115 {
 		info.Fallback = []string{"direct", "local_hls"}

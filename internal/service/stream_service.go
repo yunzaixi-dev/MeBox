@@ -69,9 +69,8 @@ var ErrCloudPlaybackUnavailable = errors.New("cloud media playback unavailable: 
 
 var ErrCloudPlaybackDisabled = errors.New("cloud media playback disabled by admin settings")
 
-// directPlayOnly reports whether the admin enabled「客户端直连解码」mode,
-// in which the host never transcodes (HLS is refused) and all playback is
-// handled by the client (direct play / 302 redirect).
+// directPlayOnly reports whether live host transcoding is disabled. Direct
+// playback and validated offline-prepared original-video VOD remain available.
 func (s *StreamService) directPlayOnly(ctx context.Context) bool {
 	if s.repo == nil || s.repo.Setting == nil {
 		return false

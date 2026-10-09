@@ -94,9 +94,11 @@
 `http.response_ready` 是应用准备提交响应的时间，**不是客户端 TTFB**；边缘缓存命中还可能复用旧响应里的请求 ID。
 必须把真实客户端的 TTFB、持续 Range 读取、Nginx／Tunnel 和主机观测一起比对，不能仅看服务端总耗时判断卡顿。
 
-AMS 核心更新使用 `Dockerfile.ams`：先以 `CGO_ENABLED=0` 构建本 fork 的静态 `mebox`，再在私有临时 build context
-放入该二进制与 Dockerfile。显式提供 `AMS_BASE_IMAGE` 为已核验的本地 AMS 基线镜像、`REVISION` 为提交 SHA，
-观测版额外提供 `PERFORMANCE_TRACE=true`。只替换 `/usr/local/bin/mebox`，保留原镜像的网页、FFmpeg、entrypoint 和系统包；
+AMS 核心与网页更新使用 `Dockerfile.ams`：先构建本 fork 的 `web/dist`，再以 `CGO_ENABLED=0` 构建静态 `mebox`，
+在私有临时 build context 放入二进制、Dockerfile 与 `web/dist`（保持此目录结构）。显式提供 `AMS_BASE_IMAGE`
+为已核验的本地 AMS 基线镜像、`REVISION` 为构建来源 SHA，观测版额外提供 `PERFORMANCE_TRACE=true`。
+Dockerfile 以 `COPY --chmod=755` 安装 `/usr/local/bin/mebox`，并将新网页复制到 `/app/web/dist`；保留基线的
+FFmpeg、entrypoint 和系统包，**不保留旧网页**。发布等待目标 image 与 healthy 同时满足，不能仅看旧容器健康。
 最终按实际镜像 ID 发布，不移动 `latest` 或覆盖原镜像。现有数据库、JWT 密钥和六个 bind 保持，升级前另做 WAL 一致性备份。
 
 #### AMS 实测与原画无损封装
@@ -124,7 +126,49 @@ AMS 核心更新使用 `Dockerfile.ams`：先以 `CGO_ENABLED=0` 构建本 fork 
 Emby 播放源会将 ffprobe 的 `matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` 别名集合规范成单个客户端容器名，
 保留 WebM/MOV 等实际扩展名；不把逗号列表当作容器或 `/Videos/.../stream` 扩展名，也不回填数据库。
 
+#### 软件原画 fMP4 HLS VOD（2026-10-10 补充）
 
+实际选中的配置是 **2 秒目标分片**（边界受原视频关键帧约束），不是现场视频转码。离线包复用原 media ID 的
+`quality=prepared` HLS 播放端点及现有 auth/profile 校验；playlist、init 和分片均受保护，不向外部 URI 转发凭据，
+也不公开 `source.json`。服务仅读取已准备资产，不启动现场 FFmpeg，因此 `direct_only` 也允许使用。
+清单为 init／分片绑定 `prepared_v` 包版本；资产请求必须匹配当前包，防止旧清单混入新包，也避免回滚后条件缓存复用错误字节。
+浏览器必须通过现有 hls.js 的 MSE 与完整 codec capability 判定；forced-direct、VR 或不支持的客户端不强制切换。
+fatal 错误回退原文件并保留位置，明确提示不会自动视频转码。逻辑 media ID、数据库身份与 history 不变；使用外挂／文本字幕，不烧录。
+
+“原画”只保证视频不重编码：原视频经独立 copy-only MP4 规范化后，与 prepared 的逐包 SHA-256、数量、顺序一致；
+另校验 PTS/DTS、源 fingerprint、codec/colors、各分片独立关键帧、完整时间轴与媒体包位置（不能落入 init）。
+原始影片、所有原音轨、字幕和附件仍保留在原文件中。兼容包只选择首条视频／首条音轨：AAC-LC 原包复制，
+FLAC、AC3、EAC3 或非 LC AAC 在离线准备时转换为 **AAC-LC 兼容音频**，不改变声道数或采样率；元数据和网页明确标出音频转换。
+AC3 `5.1(side)` 转换时显式逐路映射为规范 AAC `5.1`，保留六路信号，但侧／后环绕 speaker 标签不同，不能称空间布局完全相同。
+这不是全部音频无损，也不是多音轨 HLS 切换；需要原音轨时仍选原文件。仅接受工具支持的 AV1/H.264/HEVC；
+复制 AAC-LC 即使工具未报告布局，也必须通过真实 ASC 哈希和全包校验，不猜测布局。其他未知布局仍拒绝，实际可播取决于浏览器。
+分片使用原生 `skip_sidx` 避免 DASH sidx 改写 AAC 边界时间；时间轴超过严格门槛的源拒绝 prepared，继续原文件直连，不添加自定义 MP4 修复器。
+没有完成全客户端、全部电影或字幕字体视觉验收。
+
+离线 CLI 位于本仓库 `scripts/prepare_playback.py`，须在 **host 上使用 Python 3、FFmpeg、ffprobe**；AMS 容器没有 Python。
+从本仓库根目录执行下面命令。`SOURCE_HOST` 必须由实际 Docker bind 映射反查到 host 的真实常规文件，不能照抄容器内路径、
+使用 STRM／远程 URL 或 symlink；`CACHE_HOST` 是实际 cache bind 的 host 目录，`MEDIA_ID` 是已有原媒体 ID，不是新建记录。
+确保输出与源隔离且容器运行用户可读；不要覆盖原片或公开缓存目录。
+
+```bash
+umask 077
+read -r -p 'Host source file: ' SOURCE_HOST
+read -r -p 'Host cache directory: ' CACHE_HOST
+read -r -p 'Existing media ID: ' MEDIA_ID
+mkdir -p "$CACHE_HOST/prepared-hls"
+python3 scripts/prepare_playback.py --source "$SOURCE_HOST" \
+  --output "$CACHE_HOST/prepared-hls/$MEDIA_ID" --segment-seconds 2
+```
+
+已有目录会完整复核，返回 `status=unchanged` 而不重打；改变 `--segment-seconds` 也不会重建已有包。
+需要改参数时先在独立目录生成并验证，停止该片读取后再按授权维护流程替换；不要直接覆盖已发布缓存。
+该流程不操作数据库，不触发扫描建新身份。私有证据放在忽略的 `.transcode-state/ams-performance/`，目录 `0700`、文件 `0600`；
+公开报告不得含 token、带 query 的播放 URL、账户或完整媒体路径。
+
+真实公网冷媒体对照中，2 秒 VOD 的两轮 3600／4800 秒 seek 恢复约 1.50–1.70 秒，而启动仍为 1.568／4.944 秒。
+完整 UI 的另一次 2 秒配置启动 decoded 为 3.350 秒，原 ID 自动续播至 5289.666 秒；这不是随机页面 AB，不能承诺亚秒级。
+没有部署缺乏独立收益的 progressive 参数；微片配置曾真实解析失败并已拒绝。测量方法、失败与发布修复见
+[AMS 播放性能研究](../../docs/ams-playback-performance-study.md#17-2026-10-10-补充软件原画-vod-与真实网页验证)。
 
 ---
 
@@ -288,6 +332,15 @@ go test ./...
 go run ./cmd/server          # http://127.0.0.1:8080
 npm --prefix web run dev     # http://127.0.0.1:3000
 ```
+
+AMS 的 Linux amd64 静态核心在上述前端构建之后生成（其他目标须匹配实际 host 架构）：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o mebox ./cmd/server
+```
+
+将此 `mebox`、`Dockerfile.ams` 和 `web/dist` 放入私有 build context，按前文指定的 build args 构建候选镜像；
+只发布已核验的目标镜像，不用单独更新 binary 的方式留下旧网页。
 
 CI 会在 Release 中提供 Windows / Linux / macOS 的 amd64、arm64 单文件可执行程序。
 

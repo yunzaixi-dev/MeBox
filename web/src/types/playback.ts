@@ -26,6 +26,10 @@ export interface PlaybackInfo {
   default_quality: string
   cloud_qualities?: PlaybackQuality[]
   local_qualities: PlaybackQuality[]
+  prepared_hls?: {
+    codecs: string
+    audio_transcoded: boolean
+  }
   transcode: PlaybackTranscodeState
 }
 
