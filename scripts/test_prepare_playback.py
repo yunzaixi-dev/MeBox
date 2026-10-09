@@ -142,8 +142,19 @@ class MediaTests(unittest.TestCase):
             with self.assertRaises(prepare.PreparationError):
                 prepare.prepare(self.arguments(source, output))
 
+    def test_aac_program_config_is_not_published_as_mse_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self.make_source(directory, "aac", "5.1(side)", delay="0")
+            original = source.read_bytes()
+            output = directory / "prepared"
+            with self.assertRaises(prepare.PreparationError):
+                prepare.prepare(self.arguments(source, output))
+            self.assertFalse(output.exists())
+            self.assertEqual(source.read_bytes(), original)
+
     def test_aac_is_copied_and_multichannel_ac3_preserves_channel_identity(self):
-        for codec, channels in (("aac", "stereo"), ("aac", "5.1(side)"), ("ac3", "5.1(side)")):
+        for codec, channels in (("aac", "stereo"), ("aac", "5.1"), ("ac3", "5.1(side)")):
             with self.subTest(codec=codec), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 source = self.make_source(directory, codec, channels, delay="0")

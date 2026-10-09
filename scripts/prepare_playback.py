@@ -42,6 +42,24 @@ def probe(binary, source):
         raise PreparationError("invalid media probe response") from None
 
 
+def require_mse_aac(binary, source):
+    data = run([binary, "-v", "error", "-protocol_whitelist", "file,pipe",
+                "-select_streams", "a:0", "-show_entries", "stream=extradata",
+                "-show_data", "-of", "json", str(source)])
+    try:
+        configuration = json.loads(data)["streams"][0]["extradata"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise PreparationError("AAC configuration unavailable") from None
+    first = re.search(r"^\s*00000000:\s*([0-9a-fA-F]{4})", configuration, re.MULTILINE)
+    if not first:
+        raise PreparationError("AAC configuration unavailable")
+    header = int(first[1], 16)
+    # MIME support for mp4a.40.2 does not imply MSE accepts an AAC PCE.
+    # Preserve the original; never infer speakers or remix an unknown layout.
+    if header >> 11 != 2 or (header >> 7) & 15 > 12 or not 1 <= (header >> 3) & 15 <= 7:
+        raise PreparationError("AAC configuration is not supported by prepared MSE playback")
+
+
 def fingerprint(source):
     info = source.stat()
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -501,6 +519,8 @@ def prepare(args):
             raise PreparationError("unsupported or unknown source audio channel layout")
         if int(audio.get("sample_rate", 0)) not in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000):
             raise PreparationError("unsupported AAC sample rate; refusing resampling")
+        if not transcoded:
+            require_mse_aac(args.ffprobe, source)
     base = {"version": 1, "source_size": before[2], "source_mtime_ns": before[3]}
     if output.exists():
         metadata = output / "source.json"
