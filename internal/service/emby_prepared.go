@@ -61,6 +61,9 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		src["SupportsProbing"] = false
 		src["SupportsDirectPlay"], src["SupportsDirectStream"], src["SupportsTranscoding"] = false, true, true
 		src["TranscodingUrl"], src["TranscodingContainer"], src["TranscodingSubProtocol"] = url, "mp4", "hls"
+		if request.EnableDirectStream != nil {
+			src["SupportsDirectStream"] = *request.EnableDirectStream
+		}
 		delete(src, "Size")
 		if request.SubtitleStreamIndex != nil {
 			src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
@@ -70,6 +73,23 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 			native.AudioChannels, native.AudioSampleRate = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
 			native.VideoProfile, native.VideoLevel, native.VideoBitDepth = nativeDetails.VideoProfile, nativeDetails.VideoLevel, nativeDetails.VideoBitDepth
 			native.ColorTransfer = nativeDetails.ColorTransfer
+			if metadata.AudioTranscoded {
+				native.AudioSampleRate = 0
+			}
+		}
+		for _, stream := range src["MediaStreams"].([]map[string]any) {
+			if stream["Type"] == "Video" && nativeDetails != nil {
+				stream["BitDepth"], stream["Profile"], stream["Level"] = native.VideoBitDepth, native.VideoProfile, native.VideoLevel
+			}
+			if stream["Type"] == "Audio" {
+				stream["Profile"] = "LC"
+				if native.AudioChannels > 0 {
+					stream["Channels"] = native.AudioChannels
+				}
+				if native.AudioSampleRate > 0 {
+					stream["SampleRate"] = native.AudioSampleRate
+				}
+			}
 		}
 		if preferred < 0 && preparedClientSupports(request, m, &native, true, src["MediaStreams"].([]map[string]any)) {
 			preferred = len(variants)

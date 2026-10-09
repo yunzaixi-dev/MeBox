@@ -116,4 +116,59 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 			t.Fatalf("missing explicit source was silently replaced: %d", response.Code)
 		}
 	}
+	hlsDirectory := filepath.Join(svc.Cfg.Cache.CacheDir, "prepared-hls", "media-1")
+	if err := os.MkdirAll(hlsDirectory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hlsMeta, _ := json.Marshal(map[string]any{"version": 1, "source_size": info.Size(), "source_mtime_ns": info.ModTime().UnixNano(), "video_codec": "h264", "audio_codec": "aac", "codecs": "avc1.640028,mp4a.40.2", "audio_transcoded": false})
+	for name, data := range map[string][]byte{"source.json": hlsMeta, "index.m3u8": []byte("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.000,\nseg_00000.m4s\n#EXT-X-ENDLIST\n"), "init.mp4": []byte("initialization"), "seg_00000.m4s": []byte("fragment-data")} {
+		if err := os.WriteFile(filepath.Join(hlsDirectory, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request = httptest.NewRequest(http.MethodPost, "/emby/Items/media-1/PlaybackInfo", strings.NewReader(`{"EnableDirectPlay":false,"EnableDirectStream":false,"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac","MaxAudioChannels":2}]}}`))
+	request.Header.Set("X-Emby-Token", token)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	var hlsResult struct{ MediaSources []map[string]any }
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &hlsResult) != nil {
+		t.Fatalf("HLS negotiation: %d %s", response.Code, response.Body.String())
+	}
+	hls := hlsResult.MediaSources[0]
+	if hls["Id"] != "media-1:hls" || hls["SupportsDirectPlay"] != false || hls["SupportsDirectStream"] != false || hls["SupportsTranscoding"] != true {
+		t.Fatalf("client's HLS-only selection ignored: %#v", hls)
+	}
+	streams := hls["MediaStreams"].([]any)
+	audio := streams[1].(map[string]any)
+	if audio["Channels"] != float64(2) || audio["SampleRate"] != float64(48000) || audio["Codec"] != "aac" {
+		t.Fatalf("HLS advertised wrong audio: %#v", audio)
+	}
+	playlist := hls["TranscodingUrl"].(string)
+	request = httptest.NewRequest(http.MethodGet, "/emby"+playlist, nil)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != 200 || !strings.Contains(response.Body.String(), "#EXT-X-ENDLIST") {
+		t.Fatalf("prebuilt full timeline not served: %d %s", response.Code, response.Body.String())
+	}
+	var segment string
+	for line := range strings.SplitSeq(response.Body.String(), "\n") {
+		if strings.HasPrefix(line, "seg_") {
+			segment = line
+		}
+	}
+	base, err := url.Parse("/emby" + playlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := url.Parse(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, base.ResolveReference(relative).String(), nil)
+	request.Header.Set("Range", "bytes=0-3")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != 206 || response.Body.String() != "frag" {
+		t.Fatalf("versioned protected HLS asset failed: %d %q", response.Code, response.Body.String())
+	}
 }
