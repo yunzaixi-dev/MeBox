@@ -301,31 +301,39 @@ def read_manifest(directory):
     return segments, durations
 
 
-def stream_summary(rows):
-    first, end, count, pending = None, None, 0, None
+def packet_durations(rows):
+    """Resolve missing nonterminal durations from the next strictly greater PTS."""
+    pending = None
     for row in rows:
-        pts = number(row.get("pts_time"))
         if pending is not None:
-            if pts <= pending:
+            duration = number(row.get("pts_time")) - number(pending.get("pts_time"))
+            if duration <= 0:
                 raise PreparationError("unknown duration without a following timestamp")
-            end = pts if end is None else max(end, pts)
+            yield pending, duration
+            pending = None
         duration = row.get("duration_time")
         if duration in (None, "N/A"):
-            # HLS demuxers can omit initial duration; the next PTS gives the
-            # boundary without inventing an FPS or audio sample count.
-            pending = pts
+            # Demuxers can omit initial duration. Use the next boundary, never
+            # invent an FPS, codec sample count or an unknown final duration.
+            pending = row
         else:
             duration = number(duration)
             if duration <= 0:
                 raise PreparationError("invalid packet duration")
-            end = pts + duration if end is None else max(end, pts + duration)
-            pending = None
+            yield row, duration
+    if pending is not None:
+        raise PreparationError("final packet duration unavailable")
+
+
+def stream_summary(rows):
+    first, end, count = None, None, 0
+    for row, duration in packet_durations(rows):
+        pts = number(row.get("pts_time"))
+        end = pts + duration if end is None else max(end, pts + duration)
         first = pts if first is None else min(first, pts)
         count += 1
     if not count:
         raise PreparationError("empty media stream")
-    if pending is not None:
-        raise PreparationError("final packet duration unavailable")
     return first, end, count
 
 
@@ -448,13 +456,17 @@ def validate_mp4(directory, source, source_info, ffmpeg, ffprobe):
             raise PreparationError("audio channel layout changed")
         old_rows, new_rows = packet_rows(ffprobe, source, "a:0"), packet_rows(ffprobe, file, "a:0")
         try:
-            for old, new in itertools.zip_longest(old_rows, new_rows):
-                if old is None or new is None or old["data_hash"] != new["data_hash"]:
-                    raise PreparationError("copied audio payload or count changed")
+            for old_packet, new_packet in itertools.zip_longest(packet_durations(old_rows), packet_durations(new_rows)):
+                if old_packet is None or new_packet is None:
+                    raise PreparationError("copied audio packet count changed")
+                old, old_duration = old_packet
+                new, new_duration = new_packet
+                if old["data_hash"] != new["data_hash"]:
+                    raise PreparationError("copied audio payload changed")
                 for field in ("pts_time", "dts_time"):
                     if abs(number(new.get(field)) - (number(old.get(field)) - origin + shift)) > 0.002:
                         raise PreparationError("copied audio packet timing changed")
-                if abs(number(new.get("duration_time")) - number(old.get("duration_time"))) > 0.002:
+                if abs(new_duration - old_duration) > 0.002:
                     raise PreparationError("copied audio duration changed")
         finally:
             old_rows.close()

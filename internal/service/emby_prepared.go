@@ -64,6 +64,9 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		if request.EnableDirectStream != nil {
 			src["SupportsDirectStream"] = *request.EnableDirectStream
 		}
+		if request.EnableTranscoding != nil {
+			src["SupportsTranscoding"] = *request.EnableTranscoding
+		}
 		delete(src, "Size")
 		if request.SubtitleStreamIndex != nil {
 			src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
@@ -91,7 +94,7 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 				}
 			}
 		}
-		if preferred < 0 && preparedClientSupports(request, m, &native, true, src["MediaStreams"].([]map[string]any)) {
+		if preparedClientSupports(request, m, &native, true, src["MediaStreams"].([]map[string]any)) {
 			preferred = len(variants)
 		}
 		variants = append(variants, src)
@@ -142,6 +145,9 @@ func codecListContains(list, codec string) bool {
 func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Media, metadata *preparedMP4Metadata, hls bool, streams []map[string]any) bool {
 	profile := request.DeviceProfile
 	if profile == nil {
+		return false
+	}
+	if hls && request.EnableDirectStream != nil && !*request.EnableDirectStream && request.EnableTranscoding != nil && !*request.EnableTranscoding {
 		return false
 	}
 	if !hls && request.EnableDirectPlay != nil && !*request.EnableDirectPlay && request.EnableDirectStream != nil && !*request.EnableDirectStream {

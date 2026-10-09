@@ -135,7 +135,7 @@ Emby 播放源会将 ffprobe 的 `matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` 别
 浏览器必须通过现有 hls.js 的 MSE 与完整 codec capability 判定；forced-direct、VR 或不支持的客户端不强制切换。
 fatal 错误回退原文件并保留位置，明确提示不会自动视频转码。逻辑 media ID、数据库身份与 history 不变；使用外挂／文本字幕，不烧录。
 Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同用户、同设备经 `/Sessions/Capabilities/Full` 上报的短期能力；GET／POST、根路由及 `/emby` 大小写兼容入口共用此协商，不按客户端名称分支。
-明确支持相应 codec／MP4 的客户端优先收到原 ID 下的 faststart MP4；支持 fMP4 HLS 的客户端可协商 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码。
+明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；只有原生 MP4 能力或明确选择原音轨 MP4 时，使用原 ID 下的 faststart copy-only MP4。音频转换在来源名称明确标记。
 未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。字幕需要客户端支持现有外挂交付，不自动烧录。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
 

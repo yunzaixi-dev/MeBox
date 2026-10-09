@@ -64,13 +64,15 @@ func embyPlaybackRequest(c *gin.Context) (model.EmbyPlaybackInfoRequest, error) 
 		}
 		value := values[0]
 		switch strings.ToLower(key) {
-		case "enabledirectplay", "enabledirectstream":
+		case "enabledirectplay", "enabledirectstream", "enabletranscoding":
 			flag, err := strconv.ParseBool(value)
 			if err != nil {
 				return request, err
 			}
 			if strings.EqualFold(key, "EnableDirectPlay") {
 				request.EnableDirectPlay = &flag
+			} else if strings.EqualFold(key, "EnableTranscoding") {
+				request.EnableTranscoding = &flag
 			} else {
 				request.EnableDirectStream = &flag
 			}

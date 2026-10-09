@@ -34,6 +34,9 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(count, 3)
         with self.assertRaises(prepare.PreparationError):
             prepare.stream_summary([*rows[:2], {"pts_time": "0.021333", "duration_time": "N/A"}])
+        for following in ("-0.021333", "-0.03"):
+            with self.subTest(following=following), self.assertRaises(prepare.PreparationError):
+                prepare.stream_summary([rows[0], {"pts_time": following, "duration_time": "0.021333"}])
 
     def test_init_configuration_is_derived_not_guessed(self):
         def box(kind, payload):
@@ -231,7 +234,24 @@ class MediaTests(unittest.TestCase):
     def test_native_pce_audio_is_copied_without_guessing_speakers(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            source = self.make_source(directory, "aac", "5.1(side)", delay="0")
+            encoded = self.make_source(directory, "aac", "5.1(side)", delay="0")
+            source = directory / "pce-no-default-duration.mkv"
+            prepare.run([self.ffmpeg, "-v", "error", "-i", str(encoded), "-map", "0", "-c", "copy",
+                         "-write_crc32", "0", str(source)])
+            # Omit the optional Matroska AAC DefaultDuration, as in real PCE
+            # sources. Equal-sized EBML Void preserves every media byte/offset;
+            # CRCs were disabled above so the resulting container remains valid.
+            hint = bytes.fromhex("23e3838401458555")  # 1024/48000 s in nanoseconds
+            data = source.read_bytes()
+            self.assertEqual(data.count(hint), 1)
+            source.write_bytes(data.replace(hint, bytes.fromhex("ec86000000000000"), 1))
+            rows = prepare.packet_rows(self.ffprobe, source, "a:0")
+            try:
+                first = next(rows)
+                self.assertIn(first.get("duration_time"), (None, "N/A"))
+                self.assertLess(float(first["pts_time"]), 0)
+            finally:
+                rows.close()
             with self.assertRaises(prepare.PreparationError):
                 prepare.require_mse_aac(self.ffprobe, source)
             original = source.read_bytes()
@@ -246,6 +266,10 @@ class MediaTests(unittest.TestCase):
                              [r["data_hash"] for r in prepare.packet_rows(self.ffprobe, file, "a:0")])
             self.assertEqual(self.channel_frequencies(file), self.channel_frequencies(source))
             self.assertEqual(source.read_bytes(), original)
+            old_first, old_end, _ = prepare.stream_summary(prepare.packet_rows(self.ffprobe, source, "a:0"))
+            new_first, new_end, _ = prepare.stream_summary(prepare.packet_rows(self.ffprobe, file, "a:0"))
+            self.assertAlmostEqual(new_first, old_first, delta=0.002)
+            self.assertAlmostEqual(new_end, old_end, delta=0.002)
 
     def test_native_existing_source_and_package_mutations_are_refused(self):
         for mutation in ("source", "payload", "timeline", "marker", "oversized_marker", "symlink", "directory_symlink", "foreign"):

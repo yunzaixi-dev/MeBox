@@ -171,4 +171,21 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 	if response.Code != 206 || response.Body.String() != "frag" {
 		t.Fatalf("versioned protected HLS asset failed: %d %q", response.Code, response.Body.String())
 	}
+	for _, query := range []string{"", "EnableDirectStream=false&EnableTranscoding=false", "MediaSourceId=media-1:mp4"} {
+		request = httptest.NewRequest(http.MethodPost, "/emby/Items/media-1/PlaybackInfo?"+query, strings.NewReader(`{"DeviceProfile":{"DirectPlayProfiles":[{"Type":"Video","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac"}],"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac"}]}}`))
+		request.Header.Set("X-Emby-Token", token)
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var result struct{ MediaSources []map[string]any }
+		if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+			t.Fatalf("mixed capabilities: %d %s", response.Code, response.Body.String())
+		}
+		want := "media-1:hls"
+		if query != "" {
+			want = "media-1:mp4"
+		}
+		if result.MediaSources[0]["Id"] != want {
+			t.Fatalf("negotiation ignored capabilities, disabled paths or explicit original audio: %v", result.MediaSources[0]["Id"])
+		}
+	}
 }

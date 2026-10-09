@@ -12,6 +12,7 @@ type EmbyPlaybackInfoRequest struct {
 	DeviceProfile       *EmbyDeviceProfile `json:"DeviceProfile,omitempty"`
 	EnableDirectStream  *bool              `json:"EnableDirectStream,omitempty"`
 	EnableDirectPlay    *bool              `json:"EnableDirectPlay,omitempty"`
+	EnableTranscoding   *bool              `json:"EnableTranscoding,omitempty"`
 	AutoOpenLiveStream  bool               `json:"AutoOpenLiveStream,omitempty"`
 	MediaSourceId       string             `json:"MediaSourceId,omitempty"`
 }
