@@ -242,7 +242,7 @@ func TestEmbySubtitlePlaybackPreferences(t *testing.T) {
 			if err != nil || len(tracks) != len(tc.suffixes) {
 				t.Fatalf("discovery = %#v, err = %v", tracks, err)
 			}
-			out, err := svc.PlaybackInfo(t.Context(), m.ID, "")
+			out, err := svc.PlaybackInfo(t.Context(), m.ID, "", model.EmbyPlaybackInfoRequest{})
 			if err != nil {
 				t.Fatal(err)
 			}

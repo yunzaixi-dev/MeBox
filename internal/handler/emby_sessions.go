@@ -74,6 +74,16 @@ func embySessionLogoutHandler(svc *service.Container, jwtSecret string) gin.Hand
 func embySessionCapabilitiesHandler(svc *service.Container, jwtSecret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		recordEmbyPublicSessionActivity(c, svc, jwtSecret)
+		request, err := embyPlaybackRequest(c)
+		if err != nil {
+			embyError(c, http.StatusBadRequest, "invalid capabilities")
+			return
+		}
+		if request.DeviceProfile != nil && svc != nil && svc.Sessions != nil {
+			uid, _ := embyPublicSessionIdentity(c, svc, jwtSecret)
+			device := embyClientInfoFromRequest(c)
+			svc.Sessions.SetDeviceProfile(uid, device.DeviceID, device.DeviceName, device.Client, c.ClientIP(), request.DeviceProfile)
+		}
 		c.Status(http.StatusNoContent)
 	}
 }

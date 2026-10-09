@@ -87,7 +87,7 @@ func TestEmbyItemsExposeSeriesSeasonEpisodeHierarchy(t *testing.T) {
 		t.Fatalf("latest should be grouped by series: %#v", latest)
 	}
 
-	playback, err := svc.PlaybackInfo(t.Context(), seriesID, "user-1")
+	playback, err := svc.PlaybackInfo(t.Context(), seriesID, "user-1", model.EmbyPlaybackInfoRequest{})
 	if err != nil {
 		t.Fatalf("series playback fallback: %v", err)
 	}

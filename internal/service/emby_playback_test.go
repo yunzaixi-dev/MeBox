@@ -269,7 +269,7 @@ func TestEmbyPlaybackInfoRespectsDirectPlayOnly(t *testing.T) {
 		t.Fatalf("create media: %v", err)
 	}
 
-	pb, err := svc.PlaybackInfo(t.Context(), "m-1", "user-1")
+	pb, err := svc.PlaybackInfo(t.Context(), "m-1", "user-1", model.EmbyPlaybackInfoRequest{})
 	if err != nil {
 		t.Fatalf("playback info: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestEmbyPlaybackInfoRespectsDirectPlayOnly(t *testing.T) {
 	if err := svc.repo.Setting.Set(t.Context(), PlaybackDirectOnlySettingKey, "true"); err != nil {
 		t.Fatalf("enable direct-only: %v", err)
 	}
-	pb, err = svc.PlaybackInfo(t.Context(), "m-1", "user-1")
+	pb, err = svc.PlaybackInfo(t.Context(), "m-1", "user-1", model.EmbyPlaybackInfoRequest{})
 	if err != nil {
 		t.Fatalf("playback info (direct-only): %v", err)
 	}

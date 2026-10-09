@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/truewhile/MeBox/internal/model"
 )
 
 const (
@@ -23,20 +25,22 @@ func RealtimeDeletionGuardWindow() time.Duration {
 // information reported by Emby clients through AuthenticateByName and
 // /Sessions/Playing/* without requiring Playback Reporting persistence.
 type RealtimeSession struct {
-	ID             string     `json:"id"`
-	UserID         string     `json:"user_id"`
-	UserName       string     `json:"user_name,omitempty"`
-	DeviceID       string     `json:"device_id"`
-	DeviceName     string     `json:"device_name,omitempty"`
-	Client         string     `json:"client,omitempty"`
-	RemoteEndPoint string     `json:"remote_end_point,omitempty"`
-	LastActivityAt time.Time  `json:"last_activity_at"`
-	ItemID         string     `json:"item_id,omitempty"`
-	PositionTicks  int64      `json:"position_ticks,omitempty"`
-	RuntimeTicks   int64      `json:"runtime_ticks,omitempty"`
-	IsPlaying      bool       `json:"is_playing"`
-	IsPaused       bool       `json:"is_paused"`
-	LastPlaybackAt *time.Time `json:"last_playback_at,omitempty"`
+	ID              string                   `json:"id"`
+	UserID          string                   `json:"user_id"`
+	UserName        string                   `json:"user_name,omitempty"`
+	DeviceID        string                   `json:"device_id"`
+	DeviceName      string                   `json:"device_name,omitempty"`
+	Client          string                   `json:"client,omitempty"`
+	RemoteEndPoint  string                   `json:"remote_end_point,omitempty"`
+	LastActivityAt  time.Time                `json:"last_activity_at"`
+	ItemID          string                   `json:"item_id,omitempty"`
+	PositionTicks   int64                    `json:"position_ticks,omitempty"`
+	RuntimeTicks    int64                    `json:"runtime_ticks,omitempty"`
+	IsPlaying       bool                     `json:"is_playing"`
+	IsPaused        bool                     `json:"is_paused"`
+	LastPlaybackAt  *time.Time               `json:"last_playback_at,omitempty"`
+	DeviceProfile   *model.EmbyDeviceProfile `json:"-"`
+	ProfileDeviceID string                   `json:"-"`
 }
 
 type realtimeSessionInput struct {
@@ -179,4 +183,31 @@ func (s *SessionTrackerService) ListByUser(ctx context.Context, userID string) [
 		}
 	}
 	return out
+}
+
+func (s *SessionTrackerService) SetDeviceProfile(userID, deviceID, deviceName, client, remote string, profile *model.EmbyDeviceProfile) {
+	if s == nil || userID == "" || deviceID == "" {
+		return
+	}
+	key := userID + "\x00" + realtimeSessionTerminalKey(deviceID, deviceName, client, remote)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if session, ok := s.sessions[key]; ok && session.DeviceID == deviceID {
+		session.DeviceProfile, session.ProfileDeviceID = profile, deviceID
+		s.sessions[key] = session
+	}
+}
+
+func (s *SessionTrackerService) DeviceProfile(userID, deviceID, deviceName, client, remote string) *model.EmbyDeviceProfile {
+	if s == nil || userID == "" || deviceID == "" {
+		return nil
+	}
+	key := userID + "\x00" + realtimeSessionTerminalKey(deviceID, deviceName, client, remote)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	session, ok := s.sessions[key]
+	if !ok || session.ProfileDeviceID != deviceID || session.DeviceID != deviceID || session.LastActivityAt.Before(s.now().Add(-realtimeSessionTTL)) {
+		return nil
+	}
+	return session.DeviceProfile
 }

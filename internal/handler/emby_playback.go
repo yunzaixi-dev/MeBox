@@ -2,22 +2,35 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/truewhile/MeBox/internal/model"
 	"github.com/truewhile/MeBox/internal/service"
 )
 
 func embyPlaybackInfoHandler(svc *service.Container) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		uid := embyEffectiveUserID(c)
-		out, err := svc.Emby.PlaybackInfo(c.Request.Context(), c.Param("id"), uid)
+		request, err := embyPlaybackRequest(c)
+		if err != nil {
+			embyError(c, http.StatusBadRequest, "invalid playback options")
+			return
+		}
+		if request.DeviceProfile == nil && svc.Sessions != nil {
+			device := embyClientInfoFromRequest(c)
+			request.DeviceProfile = svc.Sessions.DeviceProfile(uid, device.DeviceID, device.DeviceName, device.Client, c.ClientIP())
+		}
+		out, err := svc.Emby.PlaybackInfo(c.Request.Context(), c.Param("id"), uid, request)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -32,6 +45,65 @@ func embyPlaybackInfoHandler(svc *service.Container) gin.HandlerFunc {
 		embyPrewarmPlaybackTargets(svc, c, out)
 		c.JSON(http.StatusOK, out)
 	}
+}
+
+func embyPlaybackRequest(c *gin.Context) (model.EmbyPlaybackInfoRequest, error) {
+	var request model.EmbyPlaybackInfoRequest
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+		if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			return request, err
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			return request, errors.New("invalid playback body")
+		}
+	}
+	for key, values := range c.Request.URL.Query() {
+		if len(values) != 1 {
+			continue
+		}
+		value := values[0]
+		switch strings.ToLower(key) {
+		case "enabledirectplay", "enabledirectstream":
+			flag, err := strconv.ParseBool(value)
+			if err != nil {
+				return request, err
+			}
+			if strings.EqualFold(key, "EnableDirectPlay") {
+				request.EnableDirectPlay = &flag
+			} else {
+				request.EnableDirectStream = &flag
+			}
+		case "audiostreamindex", "subtitlestreamindex":
+			index, err := strconv.Atoi(value)
+			if err != nil || index < -1 {
+				return request, errors.New("invalid stream index")
+			}
+			if strings.EqualFold(key, "AudioStreamIndex") {
+				request.AudioStreamIndex = &index
+			} else {
+				request.SubtitleStreamIndex = &index
+			}
+		case "maxstreamingbitrate", "maxaudiochannels":
+			limit, err := strconv.ParseInt(value, 10, 32)
+			if err != nil || limit < 0 {
+				return request, errors.New("invalid playback limit")
+			}
+			if strings.EqualFold(key, "MaxStreamingBitrate") {
+				request.MaxStreamingBitrate = limit
+			} else {
+				request.MaxAudioChannels = int(limit)
+			}
+		case "mediasourceid":
+			request.MediaSourceId = value
+		}
+	}
+	if request.MaxAudioChannels < 0 || request.MaxStreamingBitrate < 0 || len(request.MediaSourceId) > 128 ||
+		(request.AudioStreamIndex != nil && *request.AudioStreamIndex < -1) ||
+		(request.SubtitleStreamIndex != nil && *request.SubtitleStreamIndex < -1) {
+		return request, errors.New("invalid playback options")
+	}
+	return request, nil
 }
 
 // embyPrewarmTimeout 是单次预热的等待上限。115 开放平台在跨太平洋线路上单次
@@ -337,6 +409,32 @@ func embyVideoStreamHandler(svc *service.Container, cloudMode string) gin.Handle
 			c.Status(http.StatusNotFound)
 			return
 		}
+		if sourceID := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); strings.Contains(sourceID, ":") && sourceID != encodedID+":mp4" && sourceID != encodedID+":hls" {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		if sourceID := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); sourceID == encodedID+":hls" {
+			if !enforceScopedPlaybackToken(c, encodedID) {
+				return
+			}
+			query := c.Request.URL.Query()
+			query.Set("quality", "prepared")
+			if token := embyRequestToken(c); token != "" {
+				query.Set("api_key", token)
+			}
+			setRedirectNoStoreHeaders(c)
+			c.Redirect(http.StatusFound, absoluteRequestURL(c, "/Videos/"+url.PathEscape(encodedID)+"/master.m3u8?"+query.Encode()))
+			return
+		}
+		if source := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); source == encodedID+":mp4" {
+			if !enforceScopedPlaybackToken(c, encodedID) {
+				return
+			}
+			if svc.Stream == nil || svc.Stream.ServePreparedMP4(c.Writer, c.Request, encodedID) != nil {
+				c.Status(http.StatusNotFound)
+			}
+			return
+		}
 		if embyShouldRedirectVideoStreamToSTRM(c, svc, c.Param("id"), cloudMode) {
 			target := "/api/stream/" + url.PathEscape(strings.TrimSpace(c.Param("id")))
 			if token := embyPlaybackRedirectToken(c, svc); token != "" {
@@ -418,6 +516,9 @@ func embyVideoHLSPlaylistHandler(svc *service.Container) gin.HandlerFunc {
 			c.Status(http.StatusNotFound)
 			return
 		}
+		if !enforceScopedPlaybackToken(c, m.ID) {
+			return
+		}
 		err = svc.Stream.ServeHLSPlaylist(c.Writer, c.Request, c.Param("id"))
 		if errors.Is(err, service.ErrTranscodeDisabled) {
 			c.JSON(http.StatusConflict, gin.H{"error": "transcode disabled"})
@@ -442,6 +543,9 @@ func embyVideoHLSSegmentHandler(svc *service.Container) gin.HandlerFunc {
 		m, err := svc.Repo.Media.FindByID(c.Request.Context(), c.Param("id"))
 		if err != nil || m == nil || !mediaVisibleForRequest(c, svc, m) || svc.Stream == nil {
 			c.Status(http.StatusNotFound)
+			return
+		}
+		if !enforceScopedPlaybackToken(c, m.ID) {
 			return
 		}
 		if err := svc.Stream.ServeHLSSegment(c.Writer, c.Request, c.Param("id"), c.Param("seg")); err != nil {

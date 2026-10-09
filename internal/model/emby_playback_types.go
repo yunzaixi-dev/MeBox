@@ -5,14 +5,15 @@ type EmbyPlaybackInfoRequest struct {
 	UserId              string             `json:"UserId,omitempty"`
 	MaxStreamingBitrate int64              `json:"MaxStreamingBitrate,omitempty"`
 	StartTimeTicks      int64              `json:"StartTimeTicks,omitempty"`
-	AudioStreamIndex    int                `json:"AudioStreamIndex,omitempty"`
-	SubtitleStreamIndex int                `json:"SubtitleStreamIndex,omitempty"`
+	AudioStreamIndex    *int               `json:"AudioStreamIndex,omitempty"`
+	SubtitleStreamIndex *int               `json:"SubtitleStreamIndex,omitempty"`
 	MaxAudioChannels    int                `json:"MaxAudioChannels,omitempty"`
 	ItemId              string             `json:"ItemId,omitempty"`
 	DeviceProfile       *EmbyDeviceProfile `json:"DeviceProfile,omitempty"`
-	EnableDirectStream  bool               `json:"EnableDirectStream,omitempty"`
-	EnableDirectPlay    bool               `json:"EnableDirectPlay,omitempty"`
+	EnableDirectStream  *bool              `json:"EnableDirectStream,omitempty"`
+	EnableDirectPlay    *bool              `json:"EnableDirectPlay,omitempty"`
 	AutoOpenLiveStream  bool               `json:"AutoOpenLiveStream,omitempty"`
+	MediaSourceId       string             `json:"MediaSourceId,omitempty"`
 }
 
 // EmbyPlaybackInfoResponse 播放信息响应。
@@ -62,9 +63,9 @@ type EmbyTranscodingProfile struct {
 
 // EmbyContainerProfile 容器配置。
 type EmbyContainerProfile struct {
-	Type       string   `json:"Type,omitempty"`
-	Conditions []string `json:"Conditions,omitempty"`
-	Container  string   `json:"Container,omitempty"`
+	Type       string                 `json:"Type,omitempty"`
+	Conditions []EmbyProfileCondition `json:"Conditions,omitempty"`
+	Container  string                 `json:"Container,omitempty"`
 }
 
 // EmbyCodecProfile 编解码器配置。

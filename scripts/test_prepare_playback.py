@@ -112,8 +112,8 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, "real AV1 fixture generation failed")
         return source
 
-    def arguments(self, source, output, ffmpeg=None):
-        return argparse.Namespace(source=str(source), output=str(output), segment_seconds=0.5,
+    def arguments(self, source, output, ffmpeg=None, format="hls"):
+        return argparse.Namespace(source=str(source), output=str(output), segment_seconds=0.5, format=format,
                                   ffmpeg=ffmpeg or self.ffmpeg, ffprobe=self.ffprobe)
 
     def test_av1_flac_preserves_delayed_video_and_all_source_bytes(self):
@@ -122,7 +122,10 @@ class MediaTests(unittest.TestCase):
             source = self.make_source(directory)
             original = source.read_bytes()
             output = directory / "prepared"
-            result = prepare.prepare(self.arguments(source, output))
+            result = json.loads(prepare.run([sys.executable, str(Path(prepare.__file__).resolve()),
+                                            "--source", str(source), "--output", str(output),
+                                            "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe,
+                                            "--segment-seconds", "0.5"]))
             self.assertTrue(result["audio_transcoded"])
             self.assertEqual(result["video_codec"], "av1")
             self.assertTrue(result["codecs"].endswith(",mp4a.40.2"))
@@ -141,6 +144,182 @@ class MediaTests(unittest.TestCase):
             (output / "seg_00000.m4s").write_bytes(b"damaged")
             with self.assertRaises(prepare.PreparationError):
                 prepare.prepare(self.arguments(source, output))
+
+    def test_native_mp4_is_faststart_copy_only_and_decodes_losslessly(self):
+        for codec, channels in (("flac", "stereo"), ("aac", "stereo"),
+                                ("ac3", "5.1(side)"), ("eac3", "5.1(side)")):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = self.make_source(directory, codec, channels)
+                original = source.read_bytes()
+                output = directory / "native"
+                args = self.arguments(source, output, format="mp4")
+                result = json.loads(prepare.run([sys.executable, str(Path(prepare.__file__).resolve()),
+                                                "--format", "mp4", "--source", str(source), "--output", str(output),
+                                                "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe]))
+                self.assertFalse(result["audio_transcoded"])
+                self.assertEqual(source.read_bytes(), original)
+                file = output / "stream.mp4"
+                self.assertEqual(sorted(p.name for p in output.iterdir()), ["source.json", "stream.mp4"])
+                self.assertLessEqual((output / "source.json").stat().st_size, 4096)
+                streams = prepare.probe(self.ffprobe, file)["streams"]
+                self.assertEqual([s["codec_name"] for s in streams], ["av1", codec])
+                data = file.read_bytes()
+                boxes = [kind for kind, _, _ in prepare.box_children(data)]
+                self.assertLess(boxes.index(b"moov"), boxes.index(b"mdat"))
+                # Native copyts retains the original AV axis, including negative
+                # encoder preroll, instead of adding an offset at source start.
+                for stream in ("v:0", "a:0"):
+                    old = list(prepare.packet_rows(self.ffprobe, source, stream))
+                    new = list(prepare.packet_rows(self.ffprobe, file, stream))
+                    self.assertEqual([r["data_hash"] for r in old], [r["data_hash"] for r in new])
+                    for before, after in zip(old, new):
+                        for field in ("pts_time", "dts_time"):
+                            if before.get(field) not in (None, "N/A"):
+                                self.assertAlmostEqual(float(after[field]), float(before[field]), delta=0.002)
+                    old_first, old_end, _ = prepare.stream_summary(iter(old))
+                    new_first, new_end, _ = prepare.stream_summary(iter(new))
+                    self.assertAlmostEqual(new_first, old_first, delta=0.002)
+                    self.assertAlmostEqual(new_end, old_end, delta=0.002)
+                    # Compare all decoded packet samples, before container edit
+                    # lists trim priming/tail padding. MKV millisecond timestamps
+                    # round 1024/256 priming samples to 1008/240 in MP4; AAC's
+                    # short final declared duration also becomes discard padding.
+                    # Packet PTS/DTS/end sync is independently checked above.
+                    decode_flags = ["-flags2", "+skip_manual"] if stream == "a:0" else []
+                    hashes = [prepare.run([self.ffmpeg, "-v", "error", *decode_flags, "-i", str(path),
+                                           "-map", "0:" + stream, "-fps_mode", "passthrough",
+                                           "-f", "hash", "-hash", "sha256", "pipe:1"])
+                              for path in (source, file)]
+                    self.assertEqual(hashes[0], hashes[1])
+                self.assertEqual(prepare.prepare(args)["status"], "unchanged")
+                self.assertEqual(list(directory.glob(".prepare-mp4-*")), [])
+
+    def test_native_h264_b_frames_preserve_canonical_decode_timeline_and_color(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "reordered.mkv"
+            chapters = directory / "chapters.ffmeta"
+            chapters.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1200\ntitle=Original chapter\n")
+            prepare.run([self.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1.2",
+                         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                         "-f", "ffmetadata", "-i", str(chapters), "-t", "1.2",
+                         "-map", "0:v:0", "-map", "1:a:0", "-map_chapters", "2",
+                         "-c:v", "libx264", "-bf", "2", "-g", "10", "-threads", "2",
+                         "-vf", "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                         "-c:a", "aac", str(source)])
+            original = source.read_bytes()
+            source_chapters = json.loads(prepare.run([self.ffprobe, "-v", "error", "-show_chapters", "-of", "json", str(source)]))
+            self.assertEqual(len(source_chapters["chapters"]), 1)
+            output = directory / "native"
+            prepare.prepare(self.arguments(source, output, format="mp4"))
+            rows = list(prepare.packet_rows(self.ffprobe, output / "stream.mp4", "v:0"))
+            canonical = list(prepare.packet_rows(self.ffprobe, "pipe:0", "v:0", prepare.source_video_feed(self.ffmpeg, source)))
+            self.assertEqual([r["data_hash"] for r in rows], [r["data_hash"] for r in canonical])
+            self.assertTrue(any(r["pts_time"] != r["dts_time"] for r in rows))
+            shift = float(rows[0]["pts_time"]) - float(canonical[0]["pts_time"])
+            for normalized, new in zip(canonical, rows):
+                for field in ("pts_time", "dts_time"):
+                    self.assertAlmostEqual(float(new[field]), float(normalized[field]) + shift, delta=0.002)
+            streams = prepare.probe(self.ffprobe, output / "stream.mp4")["streams"]
+            self.assertEqual([s["codec_type"] for s in streams], ["video", "audio"])
+            video = streams[0]
+            self.assertEqual(video["color_transfer"], "bt709")
+            self.assertEqual(video["color_space"], "bt709")
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_native_pce_audio_is_copied_without_guessing_speakers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = self.make_source(directory, "aac", "5.1(side)", delay="0")
+            with self.assertRaises(prepare.PreparationError):
+                prepare.require_mse_aac(self.ffprobe, source)
+            original = source.read_bytes()
+            output = directory / "native"
+            prepare.prepare(self.arguments(source, output, format="mp4"))
+            file = output / "stream.mp4"
+            old_audio = next(s for s in prepare.probe(self.ffprobe, source)["streams"] if s["codec_type"] == "audio")
+            new_audio = next(s for s in prepare.probe(self.ffprobe, file)["streams"] if s["codec_type"] == "audio")
+            self.assertEqual(old_audio["extradata_hash"], new_audio["extradata_hash"])
+            self.assertEqual(old_audio["channels"], new_audio["channels"])
+            self.assertEqual([r["data_hash"] for r in prepare.packet_rows(self.ffprobe, source, "a:0")],
+                             [r["data_hash"] for r in prepare.packet_rows(self.ffprobe, file, "a:0")])
+            self.assertEqual(self.channel_frequencies(file), self.channel_frequencies(source))
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_native_existing_source_and_package_mutations_are_refused(self):
+        for mutation in ("source", "payload", "timeline", "marker", "oversized_marker", "symlink", "directory_symlink", "foreign"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = self.make_source(directory)
+                output = directory / "native"
+                args = self.arguments(source, output, format="mp4")
+                prepare.prepare(args)
+                file = output / "stream.mp4"
+                if mutation == "source":
+                    info = source.stat()
+                    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+                elif mutation in ("payload", "timeline"):
+                    replacement = directory / "changed.mp4"
+                    command = [self.ffmpeg, "-v", "error", "-i", str(file), "-map", "0", "-c", "copy"]
+                    if mutation == "payload":
+                        command += ["-bsf:v", "noise=amount=1"]
+                    else:
+                        baseline = list(prepare.packet_rows(self.ffprobe, file, "a:0"))
+                        command += ["-bsf:a", r"setts=pts=PTS+if(gte(PTS*TB\,0.5)\,0.007/TB\,0):dts=DTS+if(gte(DTS*TB\,0.5)\,0.007/TB\,0)"]
+                    prepare.run([*command, "-strict", "experimental", "-movflags", "+faststart", str(replacement)])
+                    file.write_bytes(replacement.read_bytes())
+                    if mutation == "timeline":
+                        shifted = list(prepare.packet_rows(self.ffprobe, file, "a:0"))
+                        self.assertEqual([r["data_hash"] for r in baseline], [r["data_hash"] for r in shifted])
+                        for field in ("pts_time", "dts_time"):
+                            self.assertTrue(any(float(after[field]) - float(before[field]) > 0.006
+                                                for before, after in zip(baseline, shifted)))
+                elif mutation == "marker":
+                    marker = output / "source.json"
+                    data = json.loads(marker.read_text())
+                    data["audio_transcoded"] = True
+                    marker.write_text(json.dumps(data))
+                elif mutation == "oversized_marker":
+                    marker = output / "source.json"
+                    marker.write_text(marker.read_text() + " " * 4096)
+                elif mutation == "symlink":
+                    elsewhere = directory / "elsewhere.mp4"
+                    file.rename(elsewhere)
+                    file.symlink_to(elsewhere)
+                elif mutation == "directory_symlink":
+                    elsewhere = directory / "elsewhere"
+                    output.rename(elsewhere)
+                    output.symlink_to(elsewhere, target_is_directory=True)
+                else:
+                    source = self.make_source(directory, "aac")
+                    args.source = str(source)
+                with self.assertRaises(prepare.PreparationError):
+                    prepare.prepare(args)
+                self.assertEqual(list(directory.glob(".prepare-mp4-*")), [])
+
+    def test_native_non_faststart_file_and_unpreservable_timeline_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            original = self.make_source(directory, "aac", delay="0")
+            output = directory / "native"
+            args = self.arguments(original, output, format="mp4")
+            prepare.prepare(args)
+            replacement = directory / "tail-moov.mp4"
+            prepare.run([self.ffmpeg, "-v", "error", "-i", str(output / "stream.mp4"),
+                         "-map", "0", "-c", "copy", str(replacement)])
+            (output / "stream.mp4").write_bytes(replacement.read_bytes())
+            with self.assertRaises(prepare.PreparationError):
+                prepare.prepare(args)
+            source = directory / "duplicate.mkv"
+            timestamp = r"if(eq(N\,5)\,PTS+0.1/TB\,PTS)"
+            prepare.run([self.ffmpeg, "-v", "error", "-i", str(original), "-map", "0", "-c", "copy",
+                         "-bsf:v", f"setts=pts={timestamp}:dts={timestamp}", str(source)])
+            refused = directory / "refused"
+            with self.assertRaises(prepare.PreparationError):
+                prepare.prepare(self.arguments(source, refused, format="mp4"))
+            self.assertFalse(refused.exists())
+            self.assertEqual(list(directory.glob(".prepare-mp4-*")), [])
 
     def test_aac_program_config_is_not_published_as_mse_compatible(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -290,31 +469,32 @@ class MediaTests(unittest.TestCase):
                 process.communicate()
 
     def test_source_changed_during_processing_is_not_published(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            source = self.make_source(directory)
-            output = directory / "prepared"
-            command = [sys.executable, str(Path(prepare.__file__).resolve()),
-                       "--source", str(source), "--output", str(output),
-                       "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                deadline = time.monotonic() + 10
-                while not list(directory.glob(".prepare-hls-*")):
-                    self.assertIsNone(process.poll(), "preparation exited before source change")
-                    self.assertLess(time.monotonic(), deadline, "preparation did not start")
-                    time.sleep(0.005)
-                info = source.stat()
-                os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
-                stdout, stderr = process.communicate(timeout=30)
-                self.assertEqual(process.returncode, 1)
-                self.assertFalse(output.exists())
-                self.assertEqual(list(directory.glob(".prepare-hls-*")), [])
-                self.assertNotIn(str(source).encode(), stdout + stderr)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                process.communicate()
+        for format in ("hls", "mp4"):
+            with self.subTest(format=format), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = self.make_source(directory)
+                output = directory / "prepared"
+                command = [sys.executable, str(Path(prepare.__file__).resolve()),
+                           "--source", str(source), "--output", str(output), "--format", format,
+                           "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe]
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not list(directory.glob(f".prepare-{format}-*")):
+                        self.assertIsNone(process.poll(), "preparation exited before source change")
+                        self.assertLess(time.monotonic(), deadline, "preparation did not start")
+                        time.sleep(0.005)
+                    info = source.stat()
+                    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+                    stdout, stderr = process.communicate(timeout=30)
+                    self.assertEqual(process.returncode, 1)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(list(directory.glob(f".prepare-{format}-*")), [])
+                    self.assertNotIn(str(source).encode(), stdout + stderr)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
 
     def test_failed_tool_leaves_no_published_or_temporary_package(self):
         with tempfile.TemporaryDirectory() as temporary:

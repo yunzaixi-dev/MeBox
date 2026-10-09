@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a validated, copy-video fMP4 HLS package without modifying its source."""
+"""Prepare validated copy-video HLS or copy-only faststart MP4 without changing the source."""
 import argparse
 import bisect
 import ctypes
@@ -329,6 +329,159 @@ def stream_summary(rows):
     return first, end, count
 
 
+def validate_video_properties(source_video, video):
+    for field in ("codec_name", "profile", "width", "height", "pix_fmt", "level"):
+        if source_video.get(field) != video.get(field):
+            raise PreparationError("video properties changed")
+    for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
+        expected = source_video.get(field)
+        if expected not in (None, "unknown", "unspecified") and video.get(field) != expected:
+            raise PreparationError("video color metadata changed")
+
+
+def read_faststart(file):
+    if file.is_symlink() or not file.is_file() or not file.stat().st_size:
+        raise PreparationError("missing or unsafe MP4 asset")
+    size = file.stat().st_size
+    moov, media = None, False
+    with file.open("rb") as stream:
+        while stream.tell() < size:
+            start = stream.tell()
+            header = stream.read(8)
+            if len(header) != 8:
+                raise PreparationError("truncated MP4 box")
+            length, kind = struct.unpack(">I4s", header)
+            if length == 1:
+                extension = stream.read(8)
+                if len(extension) != 8:
+                    raise PreparationError("truncated MP4 box")
+                length = struct.unpack(">Q", extension)[0]
+            elif length == 0:
+                length = size - start
+            if length < stream.tell() - start or start + length > size:
+                raise PreparationError("invalid MP4 box")
+            if kind == b"moof":
+                raise PreparationError("MP4 must be non-fragmented")
+            if kind == b"moov":
+                if moov is not None or media or length > 16 * 1024 * 1024:
+                    raise PreparationError("missing, oversized or non-faststart MP4 metadata")
+                stream.seek(start)
+                moov = stream.read(length)
+            if kind == b"mdat":
+                if moov is None:
+                    raise PreparationError("MP4 metadata must precede media")
+                media = True
+            stream.seek(start + length)
+    if moov is None or not media:
+        raise PreparationError("incomplete MP4")
+    return moov
+
+
+def validate_mp4(directory, source, source_info, ffmpeg, ffprobe):
+    file = directory / "stream.mp4"
+    moov = read_faststart(file)
+    info = probe(ffprobe, file)
+    source_video = next(s for s in source_info["streams"] if s.get("codec_type") == "video")
+    source_audio = next((s for s in source_info["streams"] if s.get("codec_type") == "audio"), None)
+    videos = [s for s in info["streams"] if s.get("codec_type") == "video"]
+    audios = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+    if len(videos) != 1 or len(audios) != bool(source_audio) or len(info["streams"]) != 1 + bool(source_audio):
+        raise PreparationError("unexpected prepared stream selection")
+    video = videos[0]
+    validate_video_properties(source_video, video)
+    video_configuration(moov)
+    try:
+        codecs = video_codecs(moov, video)
+    except PreparationError:
+        # Native clients negotiate the explicit codec/profile/depth fields;
+        # never guess an RFC6381 string for profiles outside the HLS subset.
+        codecs = ""
+    origin = number(source_info.get("format", {}).get("start_time", 0))
+    original = packet_rows(ffprobe, source, "v:0")
+    canonical = packet_rows(ffprobe, "pipe:0", "v:0", source_video_feed(ffmpeg, source))
+    prepared = packet_rows(ffprobe, file, "v:0")
+    shift, canonical_shift, count = None, None, 0
+    previous_dts = None
+    try:
+        for old, normalized, new in itertools.zip_longest(original, canonical, prepared):
+            if old is None or normalized is None or new is None:
+                raise PreparationError("video packet count changed")
+            if old.get("dts_time") not in (None, "N/A"):
+                dts = number(old["dts_time"])
+                if previous_dts is not None and dts <= previous_dts:
+                    raise PreparationError("source video decode timestamps are not strictly increasing")
+                previous_dts = dts
+            if old["data_hash"] != normalized["data_hash"] or normalized["data_hash"] != new["data_hash"]:
+                raise PreparationError("compressed video payload changed")
+            pts = number(new.get("pts_time"))
+            if shift is None:
+                shift = pts - (number(old.get("pts_time")) - origin)
+                canonical_shift = pts - number(normalized.get("pts_time"))
+                if abs(shift) > 0.25:
+                    raise PreparationError("video timestamp origin changed")
+            if abs(pts - (number(old.get("pts_time")) - origin + shift)) > 0.002:
+                raise PreparationError("video packet timing changed")
+            for field in ("pts_time", "dts_time"):
+                if abs(number(new.get(field)) - (number(normalized.get(field)) + canonical_shift)) > 0.002:
+                    raise PreparationError("canonical video packet timing changed")
+            duration = number(new.get("duration_time"))
+            if duration <= 0 or abs(duration - number(old.get("duration_time"))) > 0.002:
+                raise PreparationError("copied video duration changed")
+            count += 1
+    finally:
+        original.close()
+        canonical.close()
+        prepared.close()
+    if not count:
+        raise PreparationError("empty video stream")
+    _, old_end, _ = stream_summary(packet_rows(ffprobe, source, "v:0"))
+    _, new_end, _ = stream_summary(packet_rows(ffprobe, file, "v:0"))
+    if abs(new_end - (old_end - origin + shift)) > 0.002:
+        raise PreparationError("video end changed")
+    if source_audio:
+        audio = audios[0]
+        for field in ("codec_name", "profile", "channels", "sample_rate", "extradata_hash"):
+            if source_audio.get(field) != audio.get(field):
+                raise PreparationError("copied audio properties or configuration changed")
+        layout = source_audio.get("channel_layout")
+        if layout not in (None, "unknown", "unspecified") and layout != audio.get("channel_layout"):
+            raise PreparationError("audio channel layout changed")
+        old_rows, new_rows = packet_rows(ffprobe, source, "a:0"), packet_rows(ffprobe, file, "a:0")
+        try:
+            for old, new in itertools.zip_longest(old_rows, new_rows):
+                if old is None or new is None or old["data_hash"] != new["data_hash"]:
+                    raise PreparationError("copied audio payload or count changed")
+                for field in ("pts_time", "dts_time"):
+                    if abs(number(new.get(field)) - (number(old.get(field)) - origin + shift)) > 0.002:
+                        raise PreparationError("copied audio packet timing changed")
+                if abs(number(new.get("duration_time")) - number(old.get("duration_time"))) > 0.002:
+                    raise PreparationError("copied audio duration changed")
+        finally:
+            old_rows.close()
+            new_rows.close()
+        old_first, old_end, _ = stream_summary(packet_rows(ffprobe, source, "a:0"))
+        new_first, new_end, _ = stream_summary(packet_rows(ffprobe, file, "a:0"))
+        if (abs(new_first - (old_first - origin + shift)) > 0.002 or
+                abs(new_end - (old_end - origin + shift)) > 0.002):
+            raise PreparationError("audio/video synchronization changed")
+        if codecs and audio.get("codec_name") == "aac" and audio.get("profile") == "LC":
+            codecs += ",mp4a.40.2"
+        else:
+            codecs = ""
+    pixels = video.get("pix_fmt", "")
+    depth = re.search(r"(?:p|gray)(10|12|14|16)(?:le|be)?$", pixels)
+    bit_depth = int(depth[1]) if depth else int(video.get("bits_per_raw_sample", 0) or 0)
+    if not bit_depth and pixels in ("yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "gbrp", "gray", "nv12", "nv21"):
+        bit_depth = 8
+    return {"video_codec": video["codec_name"], "audio_codec": audios[0]["codec_name"] if audios else "",
+            "audio_channels": int(audios[0]["channels"]) if audios else 0,
+            "audio_sample_rate": int(audios[0]["sample_rate"]) if audios else 0,
+            "video_profile": video.get("profile", ""), "video_level": int(video.get("level", 0)),
+            "video_bit_depth": bit_depth,
+            "color_transfer": video.get("color_transfer", ""),
+            "codecs": codecs, "audio_transcoded": False}, 1
+
+
 def validate_package(directory, source, source_info, ffmpeg, ffprobe, transcoded, rewrite=False):
     segments, durations = read_manifest(directory)
     info = probe(ffprobe, directory / "index.m3u8")
@@ -339,13 +492,7 @@ def validate_package(directory, source, source_info, ffmpeg, ffprobe, transcoded
     if len(videos) != 1 or len(audios) != bool(source_audio):
         raise PreparationError("unexpected prepared stream selection")
     video = videos[0]
-    for field in ("codec_name", "profile", "width", "height", "pix_fmt", "level"):
-        if source_video.get(field) != video.get(field):
-            raise PreparationError("video properties changed")
-    for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
-        expected = source_video.get(field)
-        if expected not in (None, "unknown", "unspecified") and video.get(field) != expected:
-            raise PreparationError("video color metadata changed")
+    validate_video_properties(source_video, video)
     codecs = video_codecs((directory / "init.mp4").read_bytes(), video)
     origin = number(source_info.get("format", {}).get("start_time", 0))
     original = packet_rows(ffprobe, source, "v:0")
@@ -489,6 +636,11 @@ def publish(directory, output):
 
 def prepare(args):
     raw_source, raw_output = Path(args.source), Path(args.output)
+    native = getattr(args, "format", "hls") == "mp4"
+    for path in (raw_source, raw_output):
+        path = path.absolute()
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise PreparationError("source and output paths must not contain symlinks")
     if not raw_source.is_file() or raw_source.is_symlink():
         raise PreparationError("source must be a local regular file, not a symlink")
     source = raw_source.resolve()
@@ -510,21 +662,22 @@ def prepare(args):
     audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
     if not video or video.get("codec_name") not in ("av1", "h264", "hevc") or video.get("disposition", {}).get("attached_pic"):
         raise PreparationError("source requires a supported primary video stream")
-    transcoded = bool(audio and not (audio.get("codec_name") == "aac" and audio.get("profile") == "LC"))
+    transcoded = bool(not native and audio and not (audio.get("codec_name") == "aac" and audio.get("profile") == "LC"))
     if audio:
         admitted = {"aac", "flac", "ac3", "eac3"}
         if audio.get("codec_name") not in admitted:
             raise PreparationError("unsupported source audio codec")
         if not 1 <= audio.get("channels", 0) <= 8 or (transcoded and not audio.get("channel_layout")):
             raise PreparationError("unsupported or unknown source audio channel layout")
-        if int(audio.get("sample_rate", 0)) not in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000):
-            raise PreparationError("unsupported AAC sample rate; refusing resampling")
-        if not transcoded:
+        sample_rate = int(audio.get("sample_rate", 0))
+        if sample_rate <= 0 or (not native and sample_rate not in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000)):
+            raise PreparationError("unsupported audio sample rate; refusing resampling")
+        if not native and not transcoded:
             require_mse_aac(args.ffprobe, source)
     base = {"version": 1, "source_size": before[2], "source_mtime_ns": before[3]}
     if output.exists():
         metadata = output / "source.json"
-        if not output.is_dir() or metadata.is_symlink() or not metadata.is_file() or metadata.stat().st_size > 65536:
+        if not output.is_dir() or metadata.is_symlink() or not metadata.is_file() or metadata.stat().st_size > (4096 if native else 65536):
             raise PreparationError("refusing unrelated existing output")
         try:
             recorded = json.loads(metadata.read_text(encoding="utf-8"))
@@ -532,15 +685,23 @@ def prepare(args):
             raise PreparationError("invalid existing package metadata") from None
         if not isinstance(recorded, dict) or any(recorded.get(k) != v for k, v in base.items()):
             raise PreparationError("existing package belongs to a different or changed source")
-        details, count = validate_package(output, source, info, args.ffmpeg, args.ffprobe, transcoded)
-        if recorded != {**base, **details} or fingerprint(source) != before:
+        if native:
+            details, count = validate_mp4(output, source, info, args.ffmpeg, args.ffprobe)
+        else:
+            details, count = validate_package(output, source, info, args.ffmpeg, args.ffprobe, transcoded)
+        expected = {**base, **details}
+        if (recorded != expected or any(type(recorded.get(k)) is not type(v) for k, v in expected.items()) or
+                fingerprint(source) != before):
             raise PreparationError("existing package or source changed")
-        return {"status": "unchanged", "segments": count, **details}
-    temporary = Path(tempfile.mkdtemp(prefix=".prepare-hls-", dir=output.parent))
+        return {"status": "unchanged", **({} if native else {"segments": count}), **details}
+    temporary = Path(tempfile.mkdtemp(prefix=".prepare-mp4-" if native else ".prepare-hls-", dir=output.parent))
     try:
-        command = [args.ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe",
-                   "-copyts", "-start_at_zero", "-i", str(source),
-                   "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy"]
+        command = [args.ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-copyts"]
+        if not native:
+            command += ["-start_at_zero"]
+        # Native MP4 edit lists can represent original negative audio preroll.
+        # Shifting it to zero can clip the final copied video sample's duration.
+        command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy"]
         if video["codec_name"] == "hevc":
             command += ["-tag:v", "hvc1"]
         if audio:
@@ -549,22 +710,37 @@ def prepare(args):
                 command += ["-profile:a", "aac_low", "-b:a", "192k" if audio["channels"] <= 2 else "384k"]
                 if audio.get("channel_layout") == "5.1(side)":
                     command += ["-af", "pan=5.1|FL=FL|FR=FR|FC=FC|LFE=LFE|BL=SL|BR=SR"]
-        # DASH sidx continuity rewrites AAC PTS at HLS boundaries. HLS uses its
-        # playlist instead; omit sidx without changing the packet timing gate.
-        command += ["-avoid_negative_ts", "disabled", "-f", "hls", "-hls_time", str(args.segment_seconds),
-                    "-hls_playlist_type", "vod", "-hls_segment_type", "fmp4",
-                    "-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "independent_segments",
-                    "-hls_segment_options", "movflags=+skip_sidx",
-                    "-hls_segment_filename", str(temporary / "seg_%05d.m4s"),
-                    str(temporary / "index.m3u8")]
+        command += ["-avoid_negative_ts", "disabled"]
+        if native:
+            # Native FLAC-in-MP4 is supported by FFmpeg behind this muxer flag;
+            # every stream remains copy-only, including AAC with a PCE.
+            # Default chapter copying synthesizes a bin_data/text track even
+            # with explicit AV maps. Chapters remain intact in the original.
+            command += ["-map_chapters", "-1", "-strict", "experimental", "-max_interleave_delta", "0",
+                        "-movflags", "+faststart", "-f", "mp4", str(temporary / "stream.mp4")]
+        else:
+            # DASH sidx continuity rewrites AAC PTS at HLS boundaries. HLS uses
+            # its playlist instead; omit sidx without changing the timing gate.
+            command += ["-f", "hls", "-hls_time", str(args.segment_seconds),
+                        "-hls_playlist_type", "vod", "-hls_segment_type", "fmp4",
+                        "-hls_fmp4_init_filename", "init.mp4", "-hls_flags", "independent_segments",
+                        "-hls_segment_options", "movflags=+skip_sidx",
+                        "-hls_segment_filename", str(temporary / "seg_%05d.m4s"),
+                        str(temporary / "index.m3u8")]
         run(command)
-        details, count = validate_package(temporary, source, info, args.ffmpeg, args.ffprobe, transcoded, rewrite=True)
-        read_manifest(temporary)
+        if native:
+            details, count = validate_mp4(temporary, source, info, args.ffmpeg, args.ffprobe)
+        else:
+            details, count = validate_package(temporary, source, info, args.ffmpeg, args.ffprobe, transcoded, rewrite=True)
+            read_manifest(temporary)
         if fingerprint(source) != before:
             raise PreparationError("source changed during preparation")
         # Commit marker is last: every package asset and the source fingerprint
         # have already passed validation before this metadata becomes visible.
-        (temporary / "source.json").write_text(json.dumps({**base, **details}, sort_keys=True) + "\n", encoding="utf-8")
+        marker = json.dumps({**base, **details}, sort_keys=True) + "\n"
+        if native and len(marker.encode("utf-8")) > 4096:
+            raise PreparationError("oversized package metadata")
+        (temporary / "source.json").write_text(marker, encoding="utf-8")
         for asset in temporary.iterdir():
             with asset.open("rb") as file:
                 os.fsync(file.fileno())
@@ -581,7 +757,7 @@ def prepare(args):
             os.fsync(parent)
         finally:
             os.close(parent)
-        return {"status": "prepared", "segments": count, **details}
+        return {"status": "prepared", **({} if native else {"segments": count}), **details}
     finally:
         # Only our own mkdtemp directory is ever recursively removed.
         if temporary.exists():
@@ -602,6 +778,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--format", choices=("hls", "mp4"), default="hls")
     parser.add_argument("--segment-seconds", type=segment_seconds, default=2.0)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
