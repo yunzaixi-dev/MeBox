@@ -64,3 +64,22 @@ func TestEmbyLatestItemsCollapsesMovieVersions(t *testing.T) {
 		t.Fatalf("collapsed latest item should expose both versions, got %#v", sources)
 	}
 }
+
+func TestEmbyPlaybackSourceUsesClientContainerForFFprobeAliases(t *testing.T) {
+	svc := newTestEmbyService(t)
+	for _, tc := range []struct{ path, format, want string }{
+		{"/media/movie.mp4", "mov,mp4,m4a,3gp,3g2,mj2", "mp4"},
+		{"/media/movie.mkv", "matroska,webm", "mkv"},
+		{"/media/movie.webm", "matroska,webm", "webm"},
+		{"/media/movie.mov", "mov,mp4,m4a,3gp,3g2,mj2", "mov"},
+		{"/media/movie.strm", "mov,mp4,m4a,3gp,3g2,mj2", "mp4"},
+	} {
+		t.Run(tc.want+tc.path, func(t *testing.T) {
+			media := model.Media{Base: model.Base{ID: "container-case"}, Path: tc.path, Container: tc.format}
+			source := svc.mediaSource(t.Context(), &media, false, true)
+			if source["Container"] != tc.want || source["DirectStreamUrl"] != "/Videos/container-case/stream."+tc.want {
+				t.Fatalf("client playback format/url = %v / %v", source["Container"], source["DirectStreamUrl"])
+			}
+		})
+	}
+}

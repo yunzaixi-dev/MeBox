@@ -385,8 +385,22 @@ func embyMediaSourcePath(m *model.Media) string {
 
 func embyMediaContainer(m *model.Media) string {
 	container := strings.Trim(strings.ToLower(m.Container), ". ")
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(m.Path)), ".")
+	switch container {
+	case "matroska,webm":
+		container = "mkv"
+		if ext == "webm" {
+			container = "webm"
+		}
+	case "mov,mp4,m4a,3gp,3g2,mj2":
+		container = "mp4"
+		switch ext {
+		case "mov", "m4a", "3gp", "3g2", "mj2":
+			container = ext
+		}
+	}
 	if container == "" {
-		container = strings.TrimPrefix(strings.ToLower(filepath.Ext(m.Path)), ".")
+		container = ext
 	}
 	if container == "" && strings.TrimSpace(m.STRMURL) != "" {
 		return "strm"
