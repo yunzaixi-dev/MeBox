@@ -202,7 +202,7 @@ rtk proxy python3 scripts/prepare_playback.py --source "$SOURCE_HOST" \
 
 该版本仅复制首条视频／首条音频（AAC／FLAC／AC3／EAC3），不重编码、不混音、不猜测 PCE 声道布局；其他音轨、章节、字幕与附件保留在原文件。优化 MP4 不复制章节，避免 muxer 自动生成未请求的数据轨。
 Native MP4 使用原生 `-copyts` 保留原始时间轴／负音频 preroll，不使用会截短部分源末视频 sample 的 `-start_at_zero`；HLS 既有归零与校验逻辑不变。
-Native MP4 固定使用 FFmpeg 原生 `-chunk_duration 500000` 聚合半秒 chunk，减少交错逐包产生的 chunk offset 索引；仍为普通 faststart MP4，不增加自定义 box 解析／修复、现场处理或音视频重编码。全包 payload／时间轴门槛不变；已有包不会因工具升级自动重建，须显式准备新目录、验证后原子切换并保留旧包。索引变小不等于所有公网或设备首帧必然更快。
+半秒 chunk 聚合曾将实际影片前置索引缩小约 56%，但 Hills 真机恢复播放产生额外反向读取，公网交叉测量没有稳定首帧收益，现已撤回该参数并恢复旧包。保留默认紧密音视频交错、普通 faststart MP4、完整 payload／时间轴门槛与原文件入口；不以索引尺寸代替设备首帧验收。
 验证 moov 在 mdat 前、非碎片化、逐包 payload／数量／顺序、配置、PTS／DTS／结束同步及源 fingerprint；任一严格门槛不满足就拒绝发布，原文件继续可选。复制相同压缩包不保证不同 demuxer 的首尾 trimming 完全相同。
 服务仅读取 `prepared-mp4/<原 ID>/source.json` 和 `stream.mp4`，保留既有媒体可见性与播放 profile 权限，支持标准 Range／HEAD／条件请求；私有 no-cache 与包代际 ETag 防止回滚误用旧缓存。不调用 runtime FFmpeg／ffprobe。
 Emby 兼容入口要求访问 token，仍拒绝用途限定的外链 token；后者只能访问原有 `/api` 播放端点且绑定单片，不能借 prepared 获取账号 API 权限。
