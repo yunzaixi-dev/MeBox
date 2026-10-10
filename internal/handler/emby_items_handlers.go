@@ -78,7 +78,7 @@ func embyItemsHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -96,7 +96,7 @@ func embyItemByIDHandler(svc *service.Container) gin.HandlerFunc {
 			embyError(c, http.StatusNotFound, "item not found")
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -123,7 +123,7 @@ func embyLatestItemsHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -140,7 +140,7 @@ func embyResumeItemsHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -213,7 +213,7 @@ func embyShowSeasonsHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -256,7 +256,7 @@ func embyShowEpisodesHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }

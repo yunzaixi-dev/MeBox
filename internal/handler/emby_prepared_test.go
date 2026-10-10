@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) {
@@ -98,7 +99,8 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 			})
 		}
 	}
-	for _, query := range []string{"DeviceId=unknown", "DeviceId=test-device&MediaSourceId=media-1", "DeviceId=test-device&AudioStreamIndex=2"} {
+	svc.Cfg.PreparedMP4BaseURL = "https://37.48.70.166"
+	for _, query := range []string{"DeviceId=unknown", "DeviceId=test-device&MediaSourceId=media-1", "DeviceId=test-device&AudioStreamIndex=2", "DeviceId=test-device&MaxAudioChannels=1"} {
 		request = httptest.NewRequest(http.MethodGet, "/emby/Items/media-1/PlaybackInfo?"+query, nil)
 		request.Header.Set("X-Emby-Token", token)
 		response = httptest.NewRecorder()
@@ -106,6 +108,48 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		var result struct{ MediaSources []map[string]any }
 		if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &result) != nil || result.MediaSources[0]["Id"] != "media-1" {
 			t.Fatalf("original default/explicit choice changed: %d %s", response.Code, response.Body.String())
+		}
+		if result.MediaSources[0]["Path"] != source || strings.Contains(result.MediaSources[0]["DirectStreamUrl"].(string), "37.48.70.166") {
+			t.Fatalf("fallback moved from the original entrypoint: %#v", result.MediaSources[0])
+		}
+	}
+	if err := svc.Repo.DB.Create(&model.PlayProfile{Base: model.Base{ID: "profile-1"}, UserID: "user-1", Name: "Viewer", RequirePIN: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	pin := signPlayProfilePINToken(svc, "user-1", "profile-1", time.Now().Add(time.Hour))
+	for _, headers := range []bool{false, true} {
+		path := "/emby/Items/media-1/PlaybackInfo?DeviceId=test-device"
+		if !headers {
+			path += "&profile_id=profile-1&profile_pin_token=" + url.QueryEscape(pin)
+		}
+		request = httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("X-Emby-Token", token)
+		if headers {
+			request.Header.Set("X-Play-Profile-ID", "profile-1")
+			request.Header.Set("X-Play-Profile-PIN-Token", pin)
+		}
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var result struct{ MediaSources []map[string]any }
+		if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &result) != nil || len(result.MediaSources) != 1 {
+			t.Fatalf("direct origin negotiation: %d %s", response.Code, response.Body.String())
+		}
+		selected := result.MediaSources[0]
+		uri, err := url.Parse(selected["DirectStreamUrl"].(string))
+		if err != nil || uri.Scheme != "https" || uri.Host != "37.48.70.166" || uri.Path != "/prepared-mp4/media-1/stream.mp4" ||
+			uri.Query().Get("api_key") != token || uri.Query().Get("MediaSourceId") != "media-1:mp4" ||
+			uri.Query().Get("profile_id") != "profile-1" || uri.Query().Get("profile_pin_token") != pin ||
+			selected["Path"] != uri.String() || selected["Id"] != "media-1" {
+			t.Fatalf("direct URL lost credentials, selector or source identity: %#v", selected)
+		}
+		// Exercise the unchanged authenticated upstream that the read-only namespace proxies.
+		uri.Scheme, uri.Host, uri.Path = "", "", "/Videos/media-1/stream.mp4"
+		request = httptest.NewRequest(http.MethodGet, uri.String(), nil)
+		request.Header.Set("Range", "bytes=0-3")
+		response = httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != 206 || response.Body.String() != "fast" {
+			t.Fatalf("direct-origin query failed upstream authorization: %d %q", response.Code, response.Body.String())
 		}
 	}
 	// Explicit original selection must still serve the original bytes, not an alias.
@@ -152,6 +196,9 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 	hls := hlsResult.MediaSources[0]
 	if hls["SupportsDirectPlay"] != false || hls["SupportsDirectStream"] != false || hls["SupportsTranscoding"] != true {
 		t.Fatalf("client's HLS-only selection ignored: %#v", hls)
+	}
+	if strings.Contains(hls["Path"].(string), "37.48.70.166") || strings.Contains(hls["TranscodingUrl"].(string), "37.48.70.166") {
+		t.Fatalf("HLS moved to the MP4-only origin: %#v", hls)
 	}
 	streams := hls["MediaStreams"].([]any)
 	audio := streams[1].(map[string]any)
@@ -202,6 +249,14 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		uri, err := url.Parse(result.MediaSources[0]["DirectStreamUrl"].(string))
 		if err != nil || uri.Query().Get("MediaSourceId") != want {
 			t.Fatalf("negotiation ignored capabilities, disabled paths or explicit original audio: %v", result.MediaSources[0]["DirectStreamUrl"])
+		}
+	}
+}
+
+func TestEmbyAppendAPIKeyKeepsThirdPartyCredentialsIsolated(t *testing.T) {
+	for _, uri := range []string{"https://third-party.example/Videos/media-1/stream.mp4?MediaSourceId=media-1:mp4&token=remote", "//third-party.example/stream.mp4"} {
+		if got := embyAppendAPIKey(uri, "local-jwt"); got != uri {
+			t.Fatalf("third-party URL received local credentials: %q", got)
 		}
 	}
 }

@@ -40,7 +40,7 @@ func embyNextUpHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusOK, embyEmptyItemsPayload())
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -64,7 +64,7 @@ func embyShowNextUpHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusOK, embyEmptyItemsPayload())
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
@@ -82,7 +82,7 @@ func embySimilarHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusOK, embyEmptyItemsPayload())
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }

@@ -168,6 +168,10 @@ Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同
 prepared MP4／HLS 的 `Protocol=Http`、`IsRemote=true` 与 `Path` 指向同一个带鉴权的真实播放端点；不再把原 MKV 文件路径放进 MP4 来源。遵循 HTTP `Path` 的客户端可直接消费已协商资源，原版来源身份／路径和明确音轨选择不变。不会把 MP4 字节伪装成 MKV，也不在缺少设备身份的原版拉流请求上猜测账号内其他设备的能力。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
 
+可选 `MEBOX_PREPARED_MP4_BASE_URL=https://37.48.70.166`（配置键 `prepared_mp4_base_url`）只为 Emby PlaybackInfo 已按上述规则选中的原音轨 prepared MP4 切换媒体入口；缺省为空，继续使用现有入口。必须是可信 HTTPS origin，不能带用户凭据、query、fragment 或业务 path（仅允许空 path 或 `/`），无效配置使服务启动明确失败；不能以全局 `app.server_url` 代替它。
+选中来源的 `Path` 和 `DirectStreamUrl` 都指向 `/prepared-mp4/<原 ID>/stream.mp4`，保留资源 selector、访问 token 和播放 profile／PIN query；第三方绝对 URL 不附加本服务 JWT。该入口只读代理既有受保护的 `/Videos/<原 ID>/stream.mp4`，不缓存鉴权或媒体，不提供登录／API／写入操作。原始文件、明确其他音轨、未知或不支持的能力、HLS 和字幕继续使用原入口，权限／撤销、包代际和 fidelity 门槛不变。
+公网直连改善已有同包同恢复点的桌面软件输出证据；它不是 Android 可见首帧承诺，也不代表手机或所有解码器已经验收。
+
 “原画”只保证视频不重编码：原视频经独立 copy-only MP4 规范化后，与 prepared 的逐包 SHA-256、数量、顺序一致；
 另校验 PTS/DTS、源 fingerprint、codec/colors、各分片独立关键帧、完整时间轴与媒体包位置（不能落入 init）。
 原始影片、所有原音轨、字幕和附件仍保留在原文件中。兼容包只选择首条视频／首条音轨：AAC-LC 原包复制，

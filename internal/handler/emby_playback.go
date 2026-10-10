@@ -39,7 +39,11 @@ func embyPlaybackInfoHandler(svc *service.Container) gin.HandlerFunc {
 			embyError(c, http.StatusNotFound, "not found")
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		preparedMP4BaseURL := ""
+		if svc.Cfg != nil {
+			preparedMP4BaseURL = svc.Cfg.PreparedMP4BaseURL
+		}
+		embyAttachRequestTokenToMediaSources(c, out, preparedMP4BaseURL)
 		// 在后台把本次条目的云盘直链换好：播放器拿到 PlaybackInfo 后通常还要
 		// 1–2 秒才请求 /Videos/{id}/stream，把换链开销落在这段等待里。
 		embyPrewarmPlaybackTargets(svc, c, out)
@@ -233,50 +237,50 @@ func embySubtitleStreamHandler(svc *service.Container) gin.HandlerFunc {
 	}
 }
 
-func embyAttachRequestTokenToMediaSources(c *gin.Context, out any) {
+func embyAttachRequestTokenToMediaSources(c *gin.Context, out any, preparedMP4BaseURL string) {
 	token := embyRequestToken(c)
 	if token == "" || out == nil {
 		return
 	}
-	embyAttachTokenToMediaSourcesValue(out, token, c)
+	embyAttachTokenToMediaSourcesValue(out, token, c, preparedMP4BaseURL)
 }
 
-func embyAttachTokenToMediaSourcesValue(value any, token string, c *gin.Context) {
+func embyAttachTokenToMediaSourcesValue(value any, token string, c *gin.Context, preparedMP4BaseURL string) {
 	switch typed := value.(type) {
 	case map[string]any:
-		embyAttachTokenToMediaSourcesMap(typed, token, c)
+		embyAttachTokenToMediaSourcesMap(typed, token, c, preparedMP4BaseURL)
 	case gin.H:
-		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token, c)
+		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token, c, preparedMP4BaseURL)
 	case []map[string]any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesMap(item, token, c)
+			embyAttachTokenToMediaSourcesMap(item, token, c, preparedMP4BaseURL)
 		}
 	case []any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesValue(item, token, c)
+			embyAttachTokenToMediaSourcesValue(item, token, c, preparedMP4BaseURL)
 		}
 	}
 }
 
-func embyAttachTokenToMediaSourcesMap(out map[string]any, token string, c *gin.Context) {
+func embyAttachTokenToMediaSourcesMap(out map[string]any, token string, c *gin.Context, preparedMP4BaseURL string) {
 	if out == nil {
 		return
 	}
 	if sources, ok := out["MediaSources"].([]map[string]any); ok {
-		embyAttachTokenToMediaSources(sources, token, c)
+		embyAttachTokenToMediaSources(sources, token, c, preparedMP4BaseURL)
 	} else if sources, ok := out["MediaSources"].([]any); ok {
 		for _, source := range sources {
 			if sourceMap, ok := source.(map[string]any); ok {
-				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token, c)
+				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token, c, preparedMP4BaseURL)
 			}
 		}
 	}
 	if items, ok := out["Items"]; ok {
-		embyAttachTokenToMediaSourcesValue(items, token, c)
+		embyAttachTokenToMediaSourcesValue(items, token, c, preparedMP4BaseURL)
 	}
 }
 
-func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gin.Context) {
+func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gin.Context, preparedMP4BaseURL string) {
 	for _, source := range sources {
 		if raw, ok := source["Path"].(string); ok && source["IsRemote"] == true && source["Protocol"] == "Http" && strings.HasPrefix(raw, "/Videos/") {
 			source["Path"] = absoluteRequestURL(c, embyAppendAPIKey(raw, token))
@@ -286,7 +290,19 @@ func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gi
 			if !ok {
 				continue
 			}
-			source[key] = embyAppendAPIKey(raw, token)
+			raw = embyAppendAPIKey(raw, token)
+			if key == "DirectStreamUrl" && preparedMP4BaseURL != "" && source["IsRemote"] == true && source["Protocol"] == "Http" {
+				// Only the local prepared selector is eligible; never send this token to a remote source.
+				id := c.Param("id")
+				u, err := url.Parse(raw)
+				if err == nil && !u.IsAbs() && u.Host == "" && u.Path == "/Videos/"+id+"/stream.mp4" && u.Query().Get("MediaSourceId") == id+":mp4" {
+					u.RawQuery += externalProfileQuery(c)
+					u.Path = "/prepared-mp4/" + id + "/stream.mp4"
+					raw = preparedMP4BaseURL + u.String()
+					source["Path"] = raw
+				}
+			}
+			source[key] = raw
 		}
 		// Subtitle streams advertise a DeliveryUrl; the official Emby client
 		// fetches it directly, so it must carry the auth token too.

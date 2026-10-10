@@ -97,6 +97,7 @@ func TestEnvOverride(t *testing.T) {
 	t.Setenv("MEBOX_LICENSE_SERVER_URL", "https://license.example.com")
 	t.Setenv("MEBOX_LICENSE_HMAC_SECRET", "override-secret")
 	t.Setenv("MEBOX_LICENSE_PUBLIC_KEY", "override-public-key")
+	t.Setenv("MEBOX_PREPARED_MP4_BASE_URL", "https://37.48.70.166/")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
@@ -115,6 +116,30 @@ func TestEnvOverride(t *testing.T) {
 	}
 	if cfg.License.ServerURL != "https://license.example.com" || cfg.License.HMACSecret != "override-secret" || cfg.License.PublicKey != "override-public-key" {
 		t.Fatalf("expected license config from env, got url=%q secret=%q public_key=%q", cfg.License.ServerURL, cfg.License.HMACSecret, cfg.License.PublicKey)
+	}
+	if cfg.PreparedMP4BaseURL != "https://37.48.70.166" {
+		t.Fatalf("expected normalized prepared MP4 origin from env, got %q", cfg.PreparedMP4BaseURL)
+	}
+}
+
+func TestLoadRejectsInvalidPreparedMP4Origin(t *testing.T) {
+	wd, _ := os.Getwd()
+	defer func() { _ = os.Chdir(wd) }()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []string{
+		"http://37.48.70.166", "//37.48.70.166", "https://", "https://:443",
+		"https://user:secret@37.48.70.166", "https://37.48.70.166/prepared-mp4",
+		"https://37.48.70.166?token=secret", "https://37.48.70.166?", "https://37.48.70.166#secret", "https://37.48.70.166#",
+		"https://37.48.70.166/%2f", "https://37.48.70.166:bad", " https://37.48.70.166",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			t.Setenv("MEBOX_PREPARED_MP4_BASE_URL", origin)
+			if _, err := Load(); err == nil {
+				t.Fatal("invalid prepared MP4 origin was accepted")
+			}
+		})
 	}
 }
 

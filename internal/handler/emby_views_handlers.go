@@ -16,7 +16,7 @@ func embyViewsHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		embyAttachRequestTokenToMediaSources(c, out)
+		embyAttachRequestTokenToMediaSources(c, out, "")
 		c.JSON(http.StatusOK, out)
 	}
 }
