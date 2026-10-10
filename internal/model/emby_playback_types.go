@@ -56,7 +56,7 @@ type EmbyTranscodingProfile struct {
 	TranscodeSeekInfo         string `json:"TranscodeSeekInfo,omitempty"`
 	Context                   string `json:"Context,omitempty"`
 	EnableSubtitlesInManifest bool   `json:"EnableSubtitlesInManifest,omitempty"`
-	MaxAudioChannels          int    `json:"MaxAudioChannels,omitempty"`
+	MaxAudioChannels          string `json:"MaxAudioChannels,omitempty"`
 	MinSegments               int    `json:"MinSegments,omitempty"`
 	SegmentLength             int    `json:"SegmentLength,omitempty"`
 	BreakOnNonKeyFrames       bool   `json:"BreakOnNonKeyFrames,omitempty"`

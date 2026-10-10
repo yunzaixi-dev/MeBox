@@ -65,6 +65,16 @@ func TestEmbyPreparedHLSRequiresFragmentedMP4AndExternalSubtitleSupport(t *testi
 	if !preparedClientSupports(request, media, metadata, true, nil) {
 		t.Fatal("fMP4 HLS capability was ignored")
 	}
+	for _, tc := range []struct {
+		limit     string
+		supported bool
+	}{{"2", true}, {"1", false}, {"", true}, {"invalid", false}, {"-1", false}, {"0", false}} {
+		profile.TranscodingProfiles[0].MaxAudioChannels = tc.limit
+		if got := preparedClientSupports(request, media, metadata, true, nil); got != tc.supported {
+			t.Fatalf("standard MaxAudioChannels %q: compatible=%v, want %v", tc.limit, got, tc.supported)
+		}
+	}
+	profile.TranscodingProfiles[0].MaxAudioChannels = ""
 	no := false
 	request.EnableDirectPlay, request.EnableDirectStream = &no, &no
 	if preparedClientSupports(request, media, metadata, false, nil) {

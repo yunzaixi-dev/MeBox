@@ -191,9 +191,14 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 	matched := false
 	if hls {
 		for _, p := range profile.TranscodingProfiles {
+			if p.MaxAudioChannels != "" {
+				limit, err := strconv.Atoi(p.MaxAudioChannels)
+				if err != nil || limit <= 0 || metadata.AudioChannels == 0 || metadata.AudioChannels > limit {
+					continue
+				}
+			}
 			if strings.EqualFold(p.Type, "Video") && strings.EqualFold(p.Protocol, "hls") && codecListContains(p.Container, "mp4") && p.Container != "" &&
-				codecListContains(p.VideoCodec, metadata.VideoCodec) && (metadata.AudioCodec == "" || codecListContains(p.AudioCodec, metadata.AudioCodec)) &&
-				(p.MaxAudioChannels == 0 || metadata.AudioChannels > 0 && metadata.AudioChannels <= p.MaxAudioChannels) {
+				codecListContains(p.VideoCodec, metadata.VideoCodec) && (metadata.AudioCodec == "" || codecListContains(p.AudioCodec, metadata.AudioCodec)) {
 				matched = true
 				break
 			}
