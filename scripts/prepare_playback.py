@@ -729,7 +729,7 @@ def prepare(args):
             # Default chapter copying synthesizes a bin_data/text track even
             # with explicit AV maps. Chapters remain intact in the original.
             command += ["-map_chapters", "-1", "-strict", "experimental", "-max_interleave_delta", "0",
-                        "-movflags", "+faststart", "-f", "mp4", str(temporary / "stream.mp4")]
+                        "-chunk_duration", "500000", "-movflags", "+faststart", "-f", "mp4", str(temporary / "stream.mp4")]
         else:
             # DASH sidx continuity rewrites AAC PTS at HLS boundaries. HLS uses
             # its playlist instead; omit sidx without changing the timing gate.
