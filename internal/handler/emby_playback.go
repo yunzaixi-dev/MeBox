@@ -451,6 +451,11 @@ func embyVideoStreamHandler(svc *service.Container, cloudMode string) gin.Handle
 			if !enforceScopedPlaybackToken(c, encodedID) {
 				return
 			}
+			media, err := svc.Repo.Media.FindByID(c.Request.Context(), encodedID)
+			if err != nil || media == nil || !mediaVisibleForRequest(c, svc, media) {
+				c.Status(http.StatusNotFound)
+				return
+			}
 			if svc.Stream == nil || svc.Stream.ServePreparedMP4(c.Writer, c.Request, encodedID) != nil {
 				c.Status(http.StatusNotFound)
 			}

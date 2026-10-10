@@ -117,6 +117,13 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		t.Fatal(err)
 	}
 	pin := signPlayProfilePINToken(svc, "user-1", "profile-1", time.Now().Add(time.Hour))
+	request = httptest.NewRequest(http.MethodGet, "/Videos/media-1/stream.mp4?MediaSourceId=media-1:mp4&api_key="+token+"&profile_id=profile-1", nil)
+	request.Header.Set("Range", "bytes=0-3")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("locked profile accessed prepared MP4: %d", response.Code)
+	}
 	for _, headers := range []bool{false, true} {
 		path := "/emby/Items/media-1/PlaybackInfo?DeviceId=test-device"
 		if !headers {
@@ -151,6 +158,16 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		if response.Code != 206 || response.Body.String() != "fast" {
 			t.Fatalf("direct-origin query failed upstream authorization: %d %q", response.Code, response.Body.String())
 		}
+	}
+	if err := svc.Repo.DB.Model(&model.PlayProfile{}).Where("id = ?", "profile-1").Update("allowed_library_ids", `["unavailable-library"]`).Error; err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/Videos/media-1/stream.mp4?MediaSourceId=media-1:mp4&api_key="+token+"&profile_id=profile-1&profile_pin_token="+url.QueryEscape(pin), nil)
+	request.Header.Set("Range", "bytes=0-3")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("prepared MP4 ignored current library permission: %d", response.Code)
 	}
 	// Explicit original selection must still serve the original bytes, not an alias.
 	request = httptest.NewRequest(http.MethodGet, "/emby/Videos/media-1/stream.mkv?MediaSourceId=media-1&api_key="+token, nil)
