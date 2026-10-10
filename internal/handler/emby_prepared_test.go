@@ -126,7 +126,7 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	request = httptest.NewRequest(http.MethodPost, "/emby/Items/media-1/PlaybackInfo", strings.NewReader(`{"EnableDirectPlay":false,"EnableDirectStream":false,"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac","MaxAudioChannels":"2"}]}}`))
+	request = httptest.NewRequest(http.MethodPost, "/emby/Items/media-1/PlaybackInfo", strings.NewReader(`{"EnableDirectPlay":false,"EnableDirectStream":false,"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac","MaxAudioChannels":"2","MinSegments":"1"}]}}`))
 	request.Header.Set("X-Emby-Token", token)
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)
