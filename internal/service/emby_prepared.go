@@ -17,17 +17,26 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 	}
 	automatic := request.MediaSourceId == ""
 	wantMP4 := request.MediaSourceId == m.ID+":mp4" || automatic && request.DeviceProfile != nil && len(request.DeviceProfile.DirectPlayProfiles) > 0
+	wantMKV := request.MediaSourceId == m.ID+":mkv" || automatic && request.DeviceProfile != nil && len(request.DeviceProfile.DirectPlayProfiles) > 0
 	wantHLS := request.MediaSourceId == m.ID+":hls" || automatic && request.DeviceProfile != nil && len(request.DeviceProfile.TranscodingProfiles) > 0
 	if automatic && request.EnableDirectPlay != nil && !*request.EnableDirectPlay && request.EnableDirectStream != nil && !*request.EnableDirectStream {
 		wantMP4 = false
+		wantMKV = false
 	}
 	if automatic && request.EnableDirectStream != nil && !*request.EnableDirectStream && request.EnableTranscoding != nil && !*request.EnableTranscoding {
 		wantHLS = false
 	}
-	var nativeDetails *preparedMP4Metadata
+	var mp4Details, mkvDetails *preparedNativeMetadata
 	if wantMP4 || wantHLS {
-		// HLS uses the native package's decoder metadata even when MP4 is not offered.
-		nativeDetails, _, _ = preparedMP4(e.cfg, m)
+		mp4Details, _, _ = preparedNative(e.cfg, m, "mp4")
+	}
+	if wantMKV || wantHLS && mp4Details == nil {
+		mkvDetails, _, _ = preparedNative(e.cfg, m, "mkv")
+	}
+	// HLS uses an admitted native package's decoder metadata.
+	nativeDetails := mp4Details
+	if nativeDetails == nil {
+		nativeDetails = mkvDetails
 	}
 	// Try HLS first: a compatible HLS source always wins automatic negotiation.
 	if wantHLS {
@@ -54,7 +63,7 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 			if request.SubtitleStreamIndex != nil {
 				src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
 			}
-			native := preparedMP4Metadata{VideoCodec: metadata.VideoCodec, AudioCodec: metadata.AudioCodec}
+			native := preparedNativeMetadata{VideoCodec: metadata.VideoCodec, AudioCodec: metadata.AudioCodec}
 			if nativeDetails != nil {
 				native.AudioChannels, native.AudioSampleRate = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
 				native.VideoProfile, native.VideoLevel, native.VideoBitDepth = nativeDetails.VideoProfile, nativeDetails.VideoLevel, nativeDetails.VideoBitDepth
@@ -88,10 +97,20 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 			}
 		}
 	}
-	if wantMP4 && nativeDetails != nil {
-		url := embyDirectStreamURL(m.ID, "mp4") + "?MediaSourceId=" + m.ID + ":mp4"
-		src := e.baseMediaSource(ctx, m, "mp4", false, url, true)
-		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":mp4", MediaVersionLabel(*m)+" · 原画原音轨快速 MP4", url
+	for _, container := range []string{"mkv", "mp4"} {
+		if container == "mkv" && !wantMKV || container == "mp4" && !wantMP4 {
+			continue
+		}
+		nativeDetails := mp4Details
+		if container == "mkv" {
+			nativeDetails = mkvDetails
+		}
+		if nativeDetails == nil {
+			continue
+		}
+		url := embyDirectStreamURL(m.ID, container) + "?MediaSourceId=" + m.ID + ":" + container
+		src := e.baseMediaSource(ctx, m, container, false, url, true)
+		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID, MediaVersionLabel(*m)+" · 原画原音轨快速 "+strings.ToUpper(container), url
 		src["Path"], src["IsRemote"] = url, true
 		src["SupportsProbing"] = false
 		if request.EnableDirectPlay != nil {
@@ -113,11 +132,8 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 				stream["Channels"], stream["SampleRate"] = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
 			}
 		}
-		if !automatic {
-			return []map[string]any{src}
-		}
 		if preparedClientSupports(request, m, nativeDetails, false, streams) {
-			perftrace.Count(ctx, "playback.prepared_mp4.selected")
+			perftrace.Count(ctx, "playback.prepared_"+container+".selected")
 			src["Id"] = m.ID
 			return []map[string]any{src}
 		}
@@ -148,7 +164,7 @@ func codecListContains(list, codec string) bool {
 	return false
 }
 
-func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Media, metadata *preparedMP4Metadata, hls bool, streams []map[string]any) bool {
+func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Media, metadata *preparedNativeMetadata, hls bool, streams []map[string]any) bool {
 	profile := request.DeviceProfile
 	if profile == nil {
 		return false
@@ -195,6 +211,10 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 		return false
 	}
 	matched := false
+	container := metadata.container
+	if container == "" || hls {
+		container = "mp4"
+	}
 	if hls {
 		for _, p := range profile.TranscodingProfiles {
 			if p.MaxAudioChannels != "" {
@@ -211,7 +231,7 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 		}
 	} else {
 		for _, p := range profile.DirectPlayProfiles {
-			if strings.EqualFold(p.Type, "Video") && codecListContains(p.Container, "mp4") &&
+			if strings.EqualFold(p.Type, "Video") && codecListContains(p.Container, container) &&
 				codecListContains(p.VideoCodec, metadata.VideoCodec) && (metadata.AudioCodec == "" || codecListContains(p.AudioCodec, metadata.AudioCodec)) {
 				matched = true
 				break
@@ -221,7 +241,6 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 	if !matched {
 		return false
 	}
-	container := "mp4"
 	for _, p := range profile.ContainerProfiles {
 		if strings.EqualFold(p.Type, "Video") && codecListContains(p.Container, container) && !preparedConditionsMatch(p.Conditions, m, metadata) {
 			return false
@@ -245,7 +264,7 @@ func preparedClientSupports(request model.EmbyPlaybackInfoRequest, m *model.Medi
 	return limit <= 0 || m.DurationSec > 0 && m.SizeBytes*8/int64(m.DurationSec) <= int64(limit)
 }
 
-func preparedConditionsMatch(conditions []model.EmbyProfileCondition, m *model.Media, metadata *preparedMP4Metadata) bool {
+func preparedConditionsMatch(conditions []model.EmbyProfileCondition, m *model.Media, metadata *preparedNativeMetadata) bool {
 	for _, condition := range conditions {
 		var value string
 		switch strings.ToLower(condition.Property) {

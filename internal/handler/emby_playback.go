@@ -21,6 +21,13 @@ import (
 func embyPlaybackInfoHandler(svc *service.Container) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		uid := embyEffectiveUserID(c)
+		if _, _, remote := service.DecodeEmbyRemoteID(c.Param("id")); !remote {
+			media, err := svc.Repo.Media.FindByID(c.Request.Context(), c.Param("id"))
+			if err != nil || media == nil || !mediaVisibleForRequest(c, svc, media) {
+				embyError(c, http.StatusNotFound, "not found")
+				return
+			}
+		}
 		request, err := embyPlaybackRequest(c)
 		if err != nil {
 			embyError(c, http.StatusBadRequest, "invalid playback options")
@@ -39,11 +46,11 @@ func embyPlaybackInfoHandler(svc *service.Container) gin.HandlerFunc {
 			embyError(c, http.StatusNotFound, "not found")
 			return
 		}
-		preparedMP4BaseURL := ""
+		preparedMediaBaseURL := ""
 		if svc.Cfg != nil {
-			preparedMP4BaseURL = svc.Cfg.PreparedMP4BaseURL
+			preparedMediaBaseURL = svc.Cfg.PreparedMediaBaseURL
 		}
-		embyAttachRequestTokenToMediaSources(c, out, preparedMP4BaseURL)
+		embyAttachRequestTokenToMediaSources(c, out, preparedMediaBaseURL)
 		// 在后台把本次条目的云盘直链换好：播放器拿到 PlaybackInfo 后通常还要
 		// 1–2 秒才请求 /Videos/{id}/stream，把换链开销落在这段等待里。
 		embyPrewarmPlaybackTargets(svc, c, out)
@@ -237,50 +244,50 @@ func embySubtitleStreamHandler(svc *service.Container) gin.HandlerFunc {
 	}
 }
 
-func embyAttachRequestTokenToMediaSources(c *gin.Context, out any, preparedMP4BaseURL string) {
+func embyAttachRequestTokenToMediaSources(c *gin.Context, out any, preparedMediaBaseURL string) {
 	token := embyRequestToken(c)
 	if token == "" || out == nil {
 		return
 	}
-	embyAttachTokenToMediaSourcesValue(out, token, c, preparedMP4BaseURL)
+	embyAttachTokenToMediaSourcesValue(out, token, c, preparedMediaBaseURL)
 }
 
-func embyAttachTokenToMediaSourcesValue(value any, token string, c *gin.Context, preparedMP4BaseURL string) {
+func embyAttachTokenToMediaSourcesValue(value any, token string, c *gin.Context, preparedMediaBaseURL string) {
 	switch typed := value.(type) {
 	case map[string]any:
-		embyAttachTokenToMediaSourcesMap(typed, token, c, preparedMP4BaseURL)
+		embyAttachTokenToMediaSourcesMap(typed, token, c, preparedMediaBaseURL)
 	case gin.H:
-		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token, c, preparedMP4BaseURL)
+		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token, c, preparedMediaBaseURL)
 	case []map[string]any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesMap(item, token, c, preparedMP4BaseURL)
+			embyAttachTokenToMediaSourcesMap(item, token, c, preparedMediaBaseURL)
 		}
 	case []any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesValue(item, token, c, preparedMP4BaseURL)
+			embyAttachTokenToMediaSourcesValue(item, token, c, preparedMediaBaseURL)
 		}
 	}
 }
 
-func embyAttachTokenToMediaSourcesMap(out map[string]any, token string, c *gin.Context, preparedMP4BaseURL string) {
+func embyAttachTokenToMediaSourcesMap(out map[string]any, token string, c *gin.Context, preparedMediaBaseURL string) {
 	if out == nil {
 		return
 	}
 	if sources, ok := out["MediaSources"].([]map[string]any); ok {
-		embyAttachTokenToMediaSources(sources, token, c, preparedMP4BaseURL)
+		embyAttachTokenToMediaSources(sources, token, c, preparedMediaBaseURL)
 	} else if sources, ok := out["MediaSources"].([]any); ok {
 		for _, source := range sources {
 			if sourceMap, ok := source.(map[string]any); ok {
-				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token, c, preparedMP4BaseURL)
+				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token, c, preparedMediaBaseURL)
 			}
 		}
 	}
 	if items, ok := out["Items"]; ok {
-		embyAttachTokenToMediaSourcesValue(items, token, c, preparedMP4BaseURL)
+		embyAttachTokenToMediaSourcesValue(items, token, c, preparedMediaBaseURL)
 	}
 }
 
-func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gin.Context, preparedMP4BaseURL string) {
+func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gin.Context, preparedMediaBaseURL string) {
 	for _, source := range sources {
 		if raw, ok := source["Path"].(string); ok && source["IsRemote"] == true && source["Protocol"] == "Http" && strings.HasPrefix(raw, "/Videos/") {
 			source["Path"] = absoluteRequestURL(c, embyAppendAPIKey(raw, token))
@@ -291,14 +298,18 @@ func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gi
 				continue
 			}
 			raw = embyAppendAPIKey(raw, token)
-			if key == "DirectStreamUrl" && preparedMP4BaseURL != "" && source["IsRemote"] == true && source["Protocol"] == "Http" {
+			if key == "DirectStreamUrl" && preparedMediaBaseURL != "" && source["IsRemote"] == true && source["Protocol"] == "Http" {
 				// Only the local prepared selector is eligible; never send this token to a remote source.
 				id := c.Param("id")
 				u, err := url.Parse(raw)
-				if err == nil && !u.IsAbs() && u.Host == "" && u.Path == "/Videos/"+id+"/stream.mp4" && u.Query().Get("MediaSourceId") == id+":mp4" {
+				container := ""
+				if err == nil {
+					container = strings.TrimPrefix(u.Query().Get("MediaSourceId"), id+":")
+				}
+				if err == nil && !u.IsAbs() && u.Host == "" && (container == "mp4" || container == "mkv") && u.Query().Get("MediaSourceId") == id+":"+container && u.Path == "/Videos/"+id+"/stream."+container {
 					u.RawQuery += externalProfileQuery(c)
-					u.Path = "/prepared-mp4/" + id + "/stream.mp4"
-					raw = preparedMP4BaseURL + u.String()
+					u.Path = "/prepared-media/" + id + "/stream." + container
+					raw = preparedMediaBaseURL + u.String()
 					source["Path"] = raw
 				}
 			}
@@ -430,7 +441,7 @@ func embyVideoStreamHandler(svc *service.Container, cloudMode string) gin.Handle
 			c.Status(http.StatusNotFound)
 			return
 		}
-		if sourceID := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); strings.Contains(sourceID, ":") && sourceID != encodedID+":mp4" && sourceID != encodedID+":hls" {
+		if sourceID := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); strings.Contains(sourceID, ":") && sourceID != encodedID+":mp4" && sourceID != encodedID+":mkv" && sourceID != encodedID+":hls" {
 			c.Status(http.StatusNotFound)
 			return
 		}
@@ -447,7 +458,7 @@ func embyVideoStreamHandler(svc *service.Container, cloudMode string) gin.Handle
 			c.Redirect(http.StatusFound, absoluteRequestURL(c, "/Videos/"+url.PathEscape(encodedID)+"/master.m3u8?"+query.Encode()))
 			return
 		}
-		if source := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); source == encodedID+":mp4" {
+		if source := firstQueryValue(c, "MediaSourceId", "mediaSourceId", "mediasourceid"); source == encodedID+":mp4" || source == encodedID+":mkv" {
 			if !enforceScopedPlaybackToken(c, encodedID) {
 				return
 			}
@@ -456,7 +467,7 @@ func embyVideoStreamHandler(svc *service.Container, cloudMode string) gin.Handle
 				c.Status(http.StatusNotFound)
 				return
 			}
-			if svc.Stream == nil || svc.Stream.ServePreparedMP4(c.Writer, c.Request, encodedID) != nil {
+			if svc.Stream == nil || svc.Stream.ServePreparedNative(c.Writer, c.Request, encodedID, strings.TrimPrefix(source, encodedID+":")) != nil {
 				c.Status(http.StatusNotFound)
 			}
 			return

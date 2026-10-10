@@ -42,7 +42,7 @@ func preparedMP4Fixture(t *testing.T) (*StreamService, *config.Config, *reposito
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := json.Marshal(preparedMP4Metadata{
+	data, err := json.Marshal(preparedNativeMetadata{
 		Version: 1, SourceSize: stat.Size(), SourceMtimeNS: stat.ModTime().UnixNano(),
 		VideoCodec: "h264", AudioCodec: "aac", AudioChannels: 2, AudioSampleRate: 48000,
 		VideoProfile: "High", VideoLevel: 40, VideoBitDepth: 8, ColorTransfer: "bt709", Codecs: "avc1.640028,mp4a.40.2",
@@ -58,47 +58,76 @@ func preparedMP4Fixture(t *testing.T) (*StreamService, *config.Config, *reposito
 	return NewStreamService(cfg, zap.NewNop(), repos, nil), cfg, repos, source, dir
 }
 
-func TestPreparedMP4RangeHEADAndConditionals(t *testing.T) {
-	svc, _, _, _, _ := preparedMP4Fixture(t)
-	full := httptest.NewRecorder()
-	if err := svc.ServePreparedMP4(full, httptest.NewRequest(http.MethodGet, "/Videos/prepared-mp4-test/stream", nil), "prepared-mp4-test"); err != nil {
-		t.Fatal(err)
-	}
-	etag := full.Header().Get("ETag")
-	if full.Code != http.StatusOK || full.Body.String() != preparedMP4TestBytes || etag == "" ||
-		full.Header().Get("Content-Type") != "video/mp4" || full.Header().Get("Cache-Control") != "private, no-cache" ||
-		full.Header().Get("X-Content-Type-Options") != "nosniff" || full.Header().Get("Last-Modified") != "" {
-		t.Fatalf("full MP4 response: %d %q %v", full.Code, full.Body.String(), full.Header())
-	}
-	for _, tc := range []struct {
-		name, method, rangeValue, condition, validator, body, contentRange string
-		status                                                             int
-	}{
-		{name: "range", method: http.MethodGet, rangeValue: "bytes=2-6", body: "23456", contentRange: "bytes 2-6/20", status: http.StatusPartialContent},
-		{name: "suffix", method: http.MethodGet, rangeValue: "bytes=-3", body: "hij", contentRange: "bytes 17-19/20", status: http.StatusPartialContent},
-		{name: "HEAD", method: http.MethodHead, status: http.StatusOK},
-		{name: "cached", method: http.MethodGet, condition: "If-None-Match", validator: etag, status: http.StatusNotModified},
-		{name: "precondition", method: http.MethodGet, condition: "If-Match", validator: `"other"`, status: http.StatusPreconditionFailed},
-		{name: "IfRange current", method: http.MethodGet, rangeValue: "bytes=2-6", condition: "If-Range", validator: etag, body: "23456", contentRange: "bytes 2-6/20", status: http.StatusPartialContent},
-		{name: "IfRange stale", method: http.MethodGet, rangeValue: "bytes=2-6", condition: "If-Range", validator: `"other"`, body: preparedMP4TestBytes, status: http.StatusOK},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(tc.method, "/Videos/prepared-mp4-test/stream", nil)
-			if tc.rangeValue != "" {
-				r.Header.Set("Range", tc.rangeValue)
+func TestPreparedNativeRangeHEADAndConditionals(t *testing.T) {
+	for _, container := range []string{"mp4", "mkv"} {
+		t.Run(container, func(t *testing.T) {
+			svc, cfg, _, _, directory := preparedMP4Fixture(t)
+			contentType := "video/mp4"
+			if container == "mkv" {
+				contentType = "video/x-matroska"
+				if err := os.Rename(filepath.Join(directory, "stream.mp4"), filepath.Join(directory, "stream.mkv")); err != nil {
+					t.Fatal(err)
+				}
+				mkvRoot := filepath.Join(cfg.Cache.CacheDir, "prepared-mkv")
+				if err := os.MkdirAll(mkvRoot, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(directory, filepath.Join(mkvRoot, "prepared-mp4-test")); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if tc.condition != "" {
-				r.Header.Set(tc.condition, tc.validator)
-			}
-			w := httptest.NewRecorder()
-			if err := svc.ServePreparedMP4(w, r, "prepared-mp4-test"); err != nil {
+			full := httptest.NewRecorder()
+			if err := svc.ServePreparedNative(full, httptest.NewRequest(http.MethodGet, "/Videos/prepared-mp4-test/stream", nil), "prepared-mp4-test", container); err != nil {
 				t.Fatal(err)
 			}
-			if w.Code != tc.status || w.Body.String() != tc.body || w.Header().Get("Content-Range") != tc.contentRange {
-				t.Fatalf("response: %d %q %v", w.Code, w.Body.String(), w.Header())
+			etag := full.Header().Get("ETag")
+			if full.Code != http.StatusOK || full.Body.String() != preparedMP4TestBytes || etag == "" ||
+				full.Header().Get("Content-Type") != contentType || full.Header().Get("Cache-Control") != "private, no-cache" ||
+				full.Header().Get("X-Content-Type-Options") != "nosniff" || full.Header().Get("Last-Modified") != "" {
+				t.Fatalf("full MP4 response: %d %q %v", full.Code, full.Body.String(), full.Header())
 			}
-			if tc.method == http.MethodHead && w.Header().Get("Content-Length") != "20" {
-				t.Fatalf("HEAD length: %v", w.Header())
+			for _, tc := range []struct {
+				name, method, rangeValue, condition, validator, body, contentRange string
+				status                                                             int
+			}{
+				{name: "range", method: http.MethodGet, rangeValue: "bytes=2-6", body: "23456", contentRange: "bytes 2-6/20", status: http.StatusPartialContent},
+				{name: "suffix", method: http.MethodGet, rangeValue: "bytes=-3", body: "hij", contentRange: "bytes 17-19/20", status: http.StatusPartialContent},
+				{name: "outside asset", method: http.MethodGet, rangeValue: "bytes=20-", body: "invalid range: failed to overlap\n", contentRange: "bytes */20", status: http.StatusRequestedRangeNotSatisfiable},
+				{name: "HEAD", method: http.MethodHead, status: http.StatusOK},
+				{name: "cached", method: http.MethodGet, condition: "If-None-Match", validator: etag, status: http.StatusNotModified},
+				{name: "precondition", method: http.MethodGet, condition: "If-Match", validator: `"other"`, status: http.StatusPreconditionFailed},
+				{name: "IfRange current", method: http.MethodGet, rangeValue: "bytes=2-6", condition: "If-Range", validator: etag, body: "23456", contentRange: "bytes 2-6/20", status: http.StatusPartialContent},
+				{name: "IfRange stale", method: http.MethodGet, rangeValue: "bytes=2-6", condition: "If-Range", validator: `"other"`, body: preparedMP4TestBytes, status: http.StatusOK},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					r := httptest.NewRequest(tc.method, "/Videos/prepared-mp4-test/stream", nil)
+					if tc.rangeValue != "" {
+						r.Header.Set("Range", tc.rangeValue)
+					}
+					if tc.condition != "" {
+						r.Header.Set(tc.condition, tc.validator)
+					}
+					w := httptest.NewRecorder()
+					if err := svc.ServePreparedNative(w, r, "prepared-mp4-test", container); err != nil {
+						t.Fatal(err)
+					}
+					if w.Code != tc.status || w.Body.String() != tc.body || w.Header().Get("Content-Range") != tc.contentRange {
+						t.Fatalf("response: %d %q %v", w.Code, w.Body.String(), w.Header())
+					}
+					if tc.method == http.MethodHead && w.Header().Get("Content-Length") != "20" {
+						t.Fatalf("HEAD length: %v", w.Header())
+					}
+				})
+			}
+			if container == "mkv" {
+				marker := filepath.Join(cfg.Cache.CacheDir, "prepared-mkv", "prepared-mp4-test", "source.json")
+				if err := os.WriteFile(marker, []byte(`{"version":0}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				w := httptest.NewRecorder()
+				if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream.mkv", nil), "prepared-mp4-test", container); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
+					t.Fatalf("untrusted MKV marker served: %v %q", err, w.Body.String())
+				}
 			}
 		})
 	}
@@ -151,7 +180,7 @@ func TestPreparedMP4RejectsChangedSourceAndSymlinks(t *testing.T) {
 			}
 			w := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodGet, "/Videos/prepared-mp4-test/stream", nil)
-			if err := svc.ServePreparedMP4(w, r, "prepared-mp4-test"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
+			if err := svc.ServePreparedNative(w, r, "prepared-mp4-test", "mp4"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
 				t.Fatalf("untrusted package served: %v %q", err, w.Body.String())
 			}
 		})
@@ -185,7 +214,7 @@ func TestPreparedMP4RejectsUntrustedMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := httptest.NewRecorder()
-			if err := svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
+			if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
 				t.Fatalf("untrusted metadata served: %v %q", err, w.Body.String())
 			}
 		})
@@ -194,7 +223,7 @@ func TestPreparedMP4RejectsUntrustedMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	if err := svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test"); !errors.Is(err, ErrMediaNotFound) {
+	if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4"); !errors.Is(err, ErrMediaNotFound) {
 		t.Fatalf("oversized metadata accepted: %v", err)
 	}
 	if err := os.WriteFile(path, original, 0600); err != nil {
@@ -204,7 +233,7 @@ func TestPreparedMP4RejectsUntrustedMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = httptest.NewRecorder()
-	if err := svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test"); !errors.Is(err, ErrMediaNotFound) {
+	if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4"); !errors.Is(err, ErrMediaNotFound) {
 		t.Fatalf("request did not reload source metadata: %v", err)
 	}
 }
@@ -221,7 +250,7 @@ func stringMustJSON(t *testing.T, value any) string {
 func TestPreparedMP4RollbackDoesNotReturnFalse304(t *testing.T) {
 	svc, _, _, _, dir := preparedMP4Fixture(t)
 	w := httptest.NewRecorder()
-	if err := svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test"); err != nil {
+	if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4"); err != nil {
 		t.Fatal(err)
 	}
 	etag := w.Header().Get("ETag")
@@ -245,7 +274,7 @@ func TestPreparedMP4RollbackDoesNotReturnFalse304(t *testing.T) {
 			r.Header.Set("If-None-Match", etag)
 		}
 		w = httptest.NewRecorder()
-		if err := svc.ServePreparedMP4(w, r, "prepared-mp4-test"); err != nil {
+		if err := svc.ServePreparedNative(w, r, "prepared-mp4-test", "mp4"); err != nil {
 			t.Fatal(err)
 		}
 		if w.Code != http.StatusOK || w.Body.String() != "rolled-back-package" || w.Header().Get("ETag") == etag {
@@ -269,7 +298,7 @@ func TestPreparedMP4NativeCodecsAndLocalSourceBinding(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var metadata preparedMP4Metadata
+			var metadata preparedNativeMetadata
 			if err := json.Unmarshal(data, &metadata); err != nil {
 				t.Fatal(err)
 			}
@@ -284,7 +313,7 @@ func TestPreparedMP4NativeCodecsAndLocalSourceBinding(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := httptest.NewRecorder()
-			err = svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test")
+			err = svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4")
 			if tc.allowed {
 				if err != nil || w.Code != http.StatusOK || w.Body.String() != preparedMP4TestBytes {
 					t.Fatalf("native copied track rejected: %v %d %q", err, w.Code, w.Body.String())
@@ -311,7 +340,7 @@ func TestPreparedMP4NativeCodecsAndLocalSourceBinding(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := httptest.NewRecorder()
-			if err := svc.ServePreparedMP4(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
+			if err := svc.ServePreparedNative(w, httptest.NewRequest(http.MethodGet, "/stream", nil), "prepared-mp4-test", "mp4"); !errors.Is(err, ErrMediaNotFound) || w.Body.Len() != 0 {
 				t.Fatalf("STRM source accepted: %v %q", err, w.Body.String())
 			}
 		})

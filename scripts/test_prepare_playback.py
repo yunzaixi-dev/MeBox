@@ -24,6 +24,13 @@ class ValidationTests(unittest.TestCase):
                 prepare.segment_seconds(value)
         self.assertEqual(prepare.segment_seconds("4"), 4)
 
+    def test_resume_point_rejects_nonfinite_and_negative_values(self):
+        for value in ("nan", "inf", "-inf", "-0.001", "bad"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                prepare.resume_seconds(value)
+        self.assertEqual(prepare.resume_seconds("1855"), 1855)
+        self.assertEqual(prepare.resume_seconds("0"), 0)
+
     def test_unknown_initial_audio_duration_uses_next_pts_but_requires_end(self):
         rows = [{"pts_time": "-0.021333", "duration_time": "N/A"},
                 {"pts_time": "0", "duration_time": "0.021333"},
@@ -115,9 +122,10 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, "real AV1 fixture generation failed")
         return source
 
-    def arguments(self, source, output, ffmpeg=None, format="hls"):
+    def arguments(self, source, output, ffmpeg=None, format="hls", resume_seconds=None):
         return argparse.Namespace(source=str(source), output=str(output), segment_seconds=0.5, format=format,
-                                  ffmpeg=ffmpeg or self.ffmpeg, ffprobe=self.ffprobe)
+                                  ffmpeg=ffmpeg or self.ffmpeg, ffprobe=self.ffprobe,
+                                  mkvinfo=os.environ.get("MKVINFO", "mkvinfo"), resume_seconds=resume_seconds)
 
     def test_av1_flac_preserves_delayed_video_and_all_source_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,6 +205,52 @@ class MediaTests(unittest.TestCase):
                     self.assertEqual(hashes[0], hashes[1])
                 self.assertEqual(prepare.prepare(args)["status"], "unchanged")
                 self.assertEqual(list(directory.glob(".prepare-mp4-*")), [])
+
+    def test_native_mkv_preserves_default_ac3_samples_after_keyframe_resume(self):
+        mkvinfo = os.environ.get("MKVINFO", "mkvinfo")
+        if not shutil.which(mkvinfo):
+            self.skipTest("mkvinfo is required for native MKV checks")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            encoded = self.make_source(directory, "ac3", "5.1(side)")
+            source = directory / "original-with-extra-audio.mkv"
+            prepare.run([self.ffmpeg, "-v", "error", "-i", str(encoded), "-map", "0:v:0",
+                         "-map", "0:a:0", "-map", "0:a:0", "-c", "copy", str(source)])
+            original = source.read_bytes()
+            output = directory / "native"
+            result = json.loads(prepare.run([sys.executable, str(Path(prepare.__file__).resolve()),
+                                            "--format", "mkv", "--resume-seconds", "0.95",
+                                            "--source", str(source), "--output", str(output),
+                                            "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe,
+                                            "--mkvinfo", mkvinfo]))
+            self.assertFalse(result["audio_transcoded"])
+            self.assertEqual(result["audio_channels"], 6)
+            file = output / "stream.mkv"
+            self.assertEqual(sorted(p.name for p in output.iterdir()), ["source.json", "stream.mkv"])
+            self.assertEqual([s["codec_name"] for s in prepare.probe(self.ffprobe, file)["streams"]], ["av1", "ac3"])
+            # The default consumer must decode the same samples after a seek,
+            # not just the same compressed packets. AC3's persistent dither
+            # state makes different demuxer preroll observable well past startup.
+            for start in (None, 0.95, 1.4):
+                with self.subTest(start=start):
+                    seek = ["-ss", str(start)] if start is not None else []
+                    samples = [prepare.run([self.ffmpeg, "-v", "error", *seek, "-i", str(path),
+                                            "-t", "2", "-map", "0:a:0", "-c:a", "pcm_f64le",
+                                            "-f", "f64le", "pipe:1"]) for path in (source, file)]
+                    self.assertGreater(len(samples[0]), 0)
+                    self.assertEqual(samples[0], samples[1])
+            args = self.arguments(source, output, format="mkv", resume_seconds=0.95)
+            self.assertEqual(prepare.prepare(args)["status"], "unchanged")
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(list(directory.glob(".prepare-mkv-*")), [])
+            # A valid copy-only MKV with tail cues cannot be admitted merely
+            # because its source marker and compressed/decoded media still match.
+            replacement = directory / "tail-cues.mkv"
+            prepare.run([self.ffmpeg, "-v", "error", "-i", str(file), "-map", "0", "-c", "copy", str(replacement)])
+            replacement.replace(file)
+            with self.assertRaisesRegex(prepare.PreparationError, "cues"):
+                prepare.prepare(args)
+            self.assertEqual(source.read_bytes(), original)
 
     def test_native_h264_b_frames_preserve_canonical_decode_timeline_and_color(self):
         with tempfile.TemporaryDirectory() as temporary:

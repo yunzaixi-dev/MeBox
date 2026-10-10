@@ -160,16 +160,16 @@ Emby 播放源会将 ffprobe 的 `matroska,webm`、`mov,mp4,m4a,3gp,3g2,mj2` 别
 浏览器必须通过现有 hls.js 的 MSE 与完整 codec capability 判定；forced-direct、VR 或不支持的客户端不强制切换。
 fatal 错误回退原文件并保留位置，明确提示不会自动视频转码。逻辑 media ID、数据库身份与 history 不变；使用外挂／文本字幕，不烧录。
 Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同用户、同设备经 `/Sessions/Capabilities/Full` 上报的短期能力；GET／POST、根路由及 `/emby` 大小写兼容入口共用此协商，不按客户端名称分支。
-明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；只有原生 MP4 能力或明确选择原音轨 MP4 时，使用原 ID 下的 faststart copy-only MP4。音频转换在来源名称明确标记。
+明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；否则按已声明的原生容器能力优先选择前置 cues 的 copy-only MKV，再选择 faststart MP4。未限制容器的 `DirectPlayProfile(Type=Video)` 保持既有通配语义；没有能力声明不等于通配支持。音频转换仅存在于 HLS，并在来源名称明确标记。
 未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。显式选择和自动默认的字幕都需要客户端支持现有外挂交付，不自动烧录；明确关闭字幕不阻止 prepared。
-自动协商命中 prepared 时只返回这一个可用表示，默认 `MediaSources[].Id` 保留从条目选择的原逻辑来源 ID，真实表示由带明确资源 selector 的 URL 指定；不再把另一个可直接播放的原版候选放进同一自动响应让客户端重新选回。没有可用能力则仅返回原来源，未通过条件的 prepared 不作为自动候选。明确 `MediaSourceId=<原 ID>`／其他音轨仍请求原文件；明确 `:<mp4|hls>` 仍请求对应 prepared 资源，版本和历史身份不重建。
+自动协商命中 prepared 时只返回这一个可用表示，默认 `MediaSources[].Id` 保留从条目选择的原逻辑来源 ID，真实表示由带明确资源 selector 的 URL 指定；不再把另一个可直接播放的原版候选放进同一自动响应让客户端重新选回。没有可用能力则仅返回原来源，未通过条件的 prepared 不作为自动候选。明确 `MediaSourceId=<原 ID>`／其他音轨仍请求原文件；明确 `:<mp4|mkv|hls>` 请求对应资源，原生 selector 也须通过能力和字幕条件，不能借此绕过限制。版本和历史身份不重建。
 协商按需构建来源：兼容 HLS 命中后不再构建未使用的 MP4，prepared 命中后不再枚举／构建原版本；只有回退或明确原版选择才查询原版本。没有跨请求缓存，不跳过源 fingerprint、能力／字幕校验或文件权限检查；这降低的是服务器协商开销，不是已证明的设备首帧提速。
 `TranscodingProfile.MaxAudioChannels` 遵循 Emby schema 的字符串契约；非空上限必须为有效正整数且匹配实际音轨，否则不选 prepared。离线播放不消费 `MinSegments`，因此不为它建立强类型绑定：Hills 的 `"MinSegments":"1"` 不应阻断 PlaybackInfo，实际用于权限／选源的字段校验仍保留。
-prepared MP4／HLS 的 `Protocol=Http`、`IsRemote=true` 与 `Path` 指向同一个带鉴权的真实播放端点；不再把原 MKV 文件路径放进 MP4 来源。遵循 HTTP `Path` 的客户端可直接消费已协商资源，原版来源身份／路径和明确音轨选择不变。不会把 MP4 字节伪装成 MKV，也不在缺少设备身份的原版拉流请求上猜测账号内其他设备的能力。
+prepared MKV／MP4／HLS 的 `Protocol=Http`、`IsRemote=true` 与 `Path` 指向同一个带鉴权的真实播放端点；不会把原文件路径放进预制来源。遵循 HTTP `Path` 的客户端可直接消费已协商资源，原版来源身份／路径和明确音轨选择不变。容器名称、扩展名和 MIME 与实际字节一致，也不在缺少设备身份的原版拉流请求上猜测账号内其他设备的能力。Web 前端仍使用原有 HLS／原版路径，不强推 MKV。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
 
-可选 `MEBOX_PREPARED_MP4_BASE_URL=https://37.48.70.166`（配置键 `prepared_mp4_base_url`）只为 Emby PlaybackInfo 已按上述规则选中的原音轨 prepared MP4 切换媒体入口；缺省为空，继续使用现有入口。必须是可信 HTTPS origin，不能带用户凭据、query、fragment 或业务 path（仅允许空 path 或 `/`），无效配置使服务启动明确失败；不能以全局 `app.server_url` 代替它。
-选中来源的 `Path` 和 `DirectStreamUrl` 都指向 `/prepared-mp4/<原 ID>/stream.mp4`，保留资源 selector、访问 token 和播放 profile／PIN query；第三方绝对 URL 不附加本服务 JWT。该入口只读代理既有受保护的 `/Videos/<原 ID>/stream.mp4`，不缓存鉴权或媒体，不提供登录／API／写入操作。原始文件、明确其他音轨、未知或不支持的能力、HLS 和字幕继续使用原入口，权限／撤销、包代际和 fidelity 门槛不变。
+可选 `MEBOX_PREPARED_MEDIA_BASE_URL=https://37.48.70.166`（配置键 `prepared_media_base_url`）只为 Emby PlaybackInfo 已按上述规则选中的原音轨 prepared MKV／MP4 切换媒体入口；缺省为空，继续使用现有入口。必须是可信 HTTPS origin，不能带用户凭据、query、fragment 或业务 path（仅允许空 path 或 `/`），无效配置使服务启动明确失败；不能以全局 `app.server_url` 代替它。旧 MP4 专属配置不是兼容别名，升级须与独立入口配对切换。
+选中来源的 `Path` 和 `DirectStreamUrl` 都指向 `/prepared-media/<原 ID>/stream.<mkv|mp4>`，保留资源 selector、访问 token 和播放 profile／PIN query；第三方绝对 URL 不附加本服务 JWT。该入口只读代理既有受保护的 `/Videos/<原 ID>/stream.<mkv|mp4>`，不缓存鉴权或媒体，不提供登录／API／写入操作。原始文件、明确其他音轨、未知或不支持的能力、HLS 和字幕继续使用原入口；协商及每次原生拉流均检查当前 profile／PIN／库权限，撤销立即生效，包代际和 fidelity 门槛不变。
 公网直连改善已有同包同恢复点的桌面软件输出证据；它不是 Android 可见首帧承诺，也不代表手机或所有解码器已经验收。
 
 “原画”只保证视频不重编码：原视频经独立 copy-only MP4 规范化后，与 prepared 的逐包 SHA-256、数量、顺序一致；
@@ -209,8 +209,20 @@ rtk proxy python3 scripts/prepare_playback.py --source "$SOURCE_HOST" \
 Native MP4 使用原生 `-copyts` 保留原始时间轴／负音频 preroll，不使用会截短部分源末视频 sample 的 `-start_at_zero`；HLS 既有归零与校验逻辑不变。
 半秒 chunk 聚合曾将实际影片前置索引缩小约 56%，但 Hills 真机恢复播放产生额外反向读取，公网交叉测量没有稳定首帧收益，现已撤回该参数并恢复旧包。保留默认紧密音视频交错、普通 faststart MP4、完整 payload／时间轴门槛与原文件入口；不以索引尺寸代替设备首帧验收。
 验证 moov 在 mdat 前、非碎片化、逐包 payload／数量／顺序、配置、PTS／DTS／结束同步及源 fingerprint；任一严格门槛不满足就拒绝发布，原文件继续可选。复制相同压缩包不保证不同 demuxer 的首尾 trimming 完全相同。
-服务仅读取 `prepared-mp4/<原 ID>/source.json` 和 `stream.mp4`，保留既有媒体可见性与播放 profile 权限，支持标准 Range／HEAD／条件请求；私有 no-cache 与包代际 ETag 防止回滚误用旧缓存。不调用 runtime FFmpeg／ffprobe。
+共享原生服务只读取对应 `prepared-<mp4|mkv>/<原 ID>/source.json` 与 `stream.<mp4|mkv>`，保留既有媒体可见性与播放 profile 权限，支持标准 Range／HEAD／条件请求；私有 no-cache 与包代际 ETag 防止回滚误用旧缓存。不调用 runtime FFmpeg／ffprobe／mkvinfo。
 Emby 兼容入口要求访问 token，仍拒绝用途限定的外链 token；后者只能访问原有 `/api` 播放端点且绑定单片，不能借 prepared 获取账号 API 权限。
+
+前置 cues 的 MKV 使用同一脚本，另需已安装的原生 `mkvinfo`（可用 `--mkvinfo` 指定路径）；必须从原片生成，不能把 MP4 的恢复解码行为作为原片替代基准：
+
+```bash
+rtk proxy mkdir -p "$CACHE_HOST/prepared-mkv"
+rtk proxy python3 scripts/prepare_playback.py --source "$SOURCE_HOST" \
+  --output "$CACHE_HOST/prepared-mkv/$MEDIA_ID" --format mkv \
+  --resume-seconds 1855
+```
+
+`--resume-seconds` 是该片已知恢复点的附加验收参数，不改变媒体时间轴或播放器；只适用于 MKV，未知恢复点可省略。MKV 同样只复制首条视频／音频，保留原文件所有额外资源；除完整逐包、配置、时间轴、源 fingerprint 与 cues-before-first-Cluster 门槛外，还比对原片与输出的全片默认解码 PCM、片中／片尾及指定恢复点 PCM。任何不一致都拒绝发布；不使用 `skip_manual`、噪声生成选项或样本修复来让检查通过。恢复点检查不是对全部可能 seek 或全部解码器的穷举保证。
+
 
 已有目录会完整复核，返回 `status=unchanged` 而不重打；改变 `--segment-seconds` 也不会重建已有包。
 需要改参数时先在独立目录生成并验证，停止该片读取后再按授权维护流程替换；不要直接覆盖已发布缓存。

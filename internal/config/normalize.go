@@ -12,14 +12,14 @@ import (
 
 // normalize 填充派生默认值并自愈空的关键字段。
 func (c *Config) normalize() error {
-	if c.PreparedMP4BaseURL != "" {
-		u, err := url.Parse(c.PreparedMP4BaseURL)
+	if c.PreparedMediaBaseURL != "" {
+		u, err := url.Parse(c.PreparedMediaBaseURL)
 		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Opaque != "" ||
 			(u.Path != "" && u.Path != "/") || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery ||
-			u.Fragment != "" || strings.Contains(c.PreparedMP4BaseURL, "#") {
-			return fmt.Errorf("prepared_mp4_base_url must be an HTTPS origin without credentials, query, fragment or path")
+			u.Fragment != "" || strings.Contains(c.PreparedMediaBaseURL, "#") {
+			return fmt.Errorf("prepared_media_base_url must be an HTTPS origin without credentials, query, fragment or path")
 		}
-		c.PreparedMP4BaseURL = strings.TrimSuffix(u.String(), "/")
+		c.PreparedMediaBaseURL = strings.TrimSuffix(u.String(), "/")
 	}
 	if c.App.DataDir == "" {
 		c.App.DataDir = "./data"

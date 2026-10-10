@@ -11,7 +11,7 @@ const (
 )
 
 func setDefaults(v *viper.Viper) {
-	v.SetDefault("prepared_mp4_base_url", "")
+	v.SetDefault("prepared_media_base_url", "")
 	v.SetDefault("app.port", 8080)
 	v.SetDefault("app.debug", false)
 	v.SetDefault("app.env", "production")

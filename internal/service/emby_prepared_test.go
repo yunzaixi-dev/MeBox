@@ -13,7 +13,7 @@ import (
 
 func TestEmbyPreparedNegotiationRespectsClientLimits(t *testing.T) {
 	media := &model.Media{Width: 1920, Height: 1080, DurationSec: 100, SizeBytes: 10000000}
-	metadata := &preparedMP4Metadata{VideoCodec: "av1", AudioCodec: "aac", AudioChannels: 6, AudioSampleRate: 48000, VideoBitDepth: 10, VideoProfile: "Main", VideoLevel: 8}
+	metadata := &preparedNativeMetadata{VideoCodec: "av1", AudioCodec: "aac", AudioChannels: 6, AudioSampleRate: 48000, VideoBitDepth: 10, VideoProfile: "Main", VideoLevel: 8}
 	profile := &model.EmbyDeviceProfile{DirectPlayProfiles: []model.EmbyDirectPlayProfile{{Type: "Video", Container: "mp4", VideoCodec: "av1", AudioCodec: "aac"}}}
 	req := model.EmbyPlaybackInfoRequest{DeviceProfile: profile}
 	if !preparedClientSupports(req, media, metadata, false, nil) {
@@ -52,6 +52,13 @@ func TestEmbyPreparedNegotiationRespectsClientLimits(t *testing.T) {
 	if preparedClientSupports(req, media, metadata, false, nil) {
 		t.Fatal("AV1 was selected for an H264-only device")
 	}
+	req.DeviceProfile = &model.EmbyDeviceProfile{DirectPlayProfiles: []model.EmbyDirectPlayProfile{{Type: "Video"}}}
+	for _, container := range []string{"mp4", "mkv"} {
+		metadata.container = container
+		if !preparedClientSupports(req, media, metadata, false, nil) {
+			t.Fatalf("declared unrestricted native capability rejected %s", container)
+		}
+	}
 	req.DeviceProfile = nil
 	if preparedClientSupports(req, media, metadata, false, nil) {
 		t.Fatal("unknown capability was treated as permission to replace the original")
@@ -60,7 +67,7 @@ func TestEmbyPreparedNegotiationRespectsClientLimits(t *testing.T) {
 
 func TestEmbyPreparedHLSRequiresFragmentedMP4AndExternalSubtitleSupport(t *testing.T) {
 	media := &model.Media{DurationSec: 100, SizeBytes: 10000000}
-	metadata := &preparedMP4Metadata{VideoCodec: "av1", AudioCodec: "aac", AudioChannels: 2}
+	metadata := &preparedNativeMetadata{VideoCodec: "av1", AudioCodec: "aac", AudioChannels: 2}
 	profile := &model.EmbyDeviceProfile{TranscodingProfiles: []model.EmbyTranscodingProfile{{Type: "Video", Protocol: "hls", Container: "ts", VideoCodec: "av1", AudioCodec: "aac"}}}
 	request := model.EmbyPlaybackInfoRequest{DeviceProfile: profile}
 	if preparedClientSupports(request, media, metadata, true, nil) {
@@ -117,7 +124,7 @@ func TestEmbyPreparedHLSFallbackKeepsNativeAudioMetadata(t *testing.T) {
 	if err != nil || media == nil {
 		t.Fatalf("media: %v", err)
 	}
-	native, _, err := preparedMP4(cfg, media)
+	native, _, err := preparedNative(cfg, media, "mp4")
 	if err != nil {
 		t.Fatal(err)
 	}

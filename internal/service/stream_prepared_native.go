@@ -15,9 +15,10 @@ import (
 	"github.com/truewhile/MeBox/internal/perftrace"
 )
 
-// Prepared MP4 is an offline container conversion, never a request-time encode.
-type preparedMP4Metadata struct {
+// Prepared native media is an offline container conversion, never a request-time encode.
+type preparedNativeMetadata struct {
 	generation      string
+	container       string
 	asset           os.FileInfo
 	Version         int    `json:"version"`
 	SourceSize      int64  `json:"source_size"`
@@ -34,7 +35,10 @@ type preparedMP4Metadata struct {
 	AudioTranscoded bool   `json:"audio_transcoded"`
 }
 
-func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, string, error) {
+func preparedNative(cfg *config.Config, m *model.Media, container string) (*preparedNativeMetadata, string, error) {
+	if container != "mp4" && container != "mkv" {
+		return nil, "", ErrMediaNotFound
+	}
 	if cfg == nil || m == nil || cfg.Cache.CacheDir == "" || m.ID == "" ||
 		m.ID == "." || m.ID == ".." || m.ID != filepath.Base(m.ID) ||
 		strings.ContainsAny(m.ID, "/\\") || IsStrmMediaRow(m) || !filepath.IsAbs(m.Path) {
@@ -45,7 +49,7 @@ func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, stri
 	if err != nil || sourcePath != filepath.Clean(m.Path) {
 		return nil, "", ErrMediaNotFound
 	}
-	dir, err := filepath.Abs(filepath.Join(cfg.Cache.CacheDir, "prepared-mp4", m.ID))
+	dir, err := filepath.Abs(filepath.Join(cfg.Cache.CacheDir, "prepared-"+container, m.ID))
 	if err != nil {
 		return nil, "", ErrMediaNotFound
 	}
@@ -58,7 +62,7 @@ func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, stri
 		return nil, "", ErrMediaNotFound
 	}
 	defer root.Close()
-	f, marker, err := preparedMP4File(root, "source.json")
+	f, marker, err := preparedNativeFile(root, "source.json")
 	if err != nil {
 		return nil, "", err
 	}
@@ -67,7 +71,7 @@ func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, stri
 	if err != nil || len(data) > 4096 {
 		return nil, "", ErrMediaNotFound
 	}
-	var metadata preparedMP4Metadata
+	var metadata preparedNativeMetadata
 	if json.Unmarshal(data, &metadata) != nil || !metadata.valid(m) {
 		return nil, "", ErrMediaNotFound
 	}
@@ -75,7 +79,7 @@ func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, stri
 	if err != nil || source.Size() != metadata.SourceSize || source.ModTime().UnixNano() != metadata.SourceMtimeNS {
 		return nil, "", ErrMediaNotFound
 	}
-	asset, stat, err := preparedMP4File(root, "stream.mp4")
+	asset, stat, err := preparedNativeFile(root, "stream."+container)
 	if err != nil {
 		return nil, "", err
 	}
@@ -85,10 +89,11 @@ func preparedMP4(cfg *config.Config, m *model.Media) (*preparedMP4Metadata, stri
 	}
 	metadata.generation = strconv.FormatInt(marker.ModTime().UnixNano(), 10)
 	metadata.asset = stat
+	metadata.container = container
 	return &metadata, dir, nil
 }
 
-func (metadata *preparedMP4Metadata) valid(m *model.Media) bool {
+func (metadata *preparedNativeMetadata) valid(m *model.Media) bool {
 	if metadata.Version != 1 || metadata.AudioTranscoded ||
 		metadata.VideoCodec != strings.ToLower(strings.TrimSpace(m.VideoCodec)) ||
 		metadata.AudioCodec != strings.ToLower(strings.TrimSpace(m.AudioCodec)) ||
@@ -144,7 +149,7 @@ func (metadata *preparedMP4Metadata) valid(m *model.Media) bool {
 }
 
 // Root.Open confines race-time symlinks; SameFile verifies the checked regular file.
-func preparedMP4File(root *os.Root, name string) (*os.File, os.FileInfo, error) {
+func preparedNativeFile(root *os.Root, name string) (*os.File, os.FileInfo, error) {
 	checked, err := preparedRegularFile(filepath.Join(root.Name(), name))
 	if err != nil {
 		return nil, nil, err
@@ -161,8 +166,8 @@ func preparedMP4File(root *os.Root, name string) (*os.File, os.FileInfo, error) 
 	return f, stat, nil
 }
 
-// ServePreparedMP4 serves the validated offline asset; handlers retain authorization.
-func (s *StreamService) ServePreparedMP4(w http.ResponseWriter, r *http.Request, mediaID string) error {
+// ServePreparedNative serves a validated MP4 or MKV asset; handlers retain authorization.
+func (s *StreamService) ServePreparedNative(w http.ResponseWriter, r *http.Request, mediaID, container string) error {
 	ctx := r.Context()
 	started := perftrace.Begin(ctx)
 	defer perftrace.End(ctx, "stream.file", started)
@@ -172,7 +177,7 @@ func (s *StreamService) ServePreparedMP4(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		return err
 	}
-	metadata, dir, err := preparedMP4(s.cfg, m)
+	metadata, dir, err := preparedNative(s.cfg, m, container)
 	if err != nil {
 		return err
 	}
@@ -181,7 +186,7 @@ func (s *StreamService) ServePreparedMP4(w http.ResponseWriter, r *http.Request,
 		return ErrMediaNotFound
 	}
 	defer root.Close()
-	f, stat, err := preparedMP4File(root, "stream.mp4")
+	f, stat, err := preparedNativeFile(root, "stream."+container)
 	if err != nil || !os.SameFile(metadata.asset, stat) || metadata.asset.Size() != stat.Size() ||
 		!metadata.asset.ModTime().Equal(stat.ModTime()) {
 		if f != nil {
@@ -190,14 +195,18 @@ func (s *StreamService) ServePreparedMP4(w http.ResponseWriter, r *http.Request,
 		return ErrMediaNotFound
 	}
 	defer f.Close()
-	w.Header().Set("Content-Type", "video/mp4")
+	contentType := "video/mp4"
+	if container == "mkv" {
+		contentType = "video/x-matroska"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Cache-Control", "private, no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("ETag", `"prepared-mp4-`+metadata.generation+`"`)
+	w.Header().Set("ETag", `"prepared-`+container+`-`+metadata.generation+`"`)
 	transferStarted := perftrace.Begin(ctx)
 	// ETag is authoritative: date validators cannot distinguish a package rollback.
-	http.ServeContent(w, r, "stream.mp4", time.Time{}, perftrace.Reader(ctx, f))
+	http.ServeContent(w, r, "stream."+container, time.Time{}, perftrace.Reader(ctx, f))
 	perftrace.End(ctx, "stream.file.serve_content", transferStarted)
 	return nil
 }

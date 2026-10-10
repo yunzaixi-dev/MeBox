@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare validated copy-video HLS or copy-only faststart MP4 without changing the source."""
+"""Prepare validated copy-video HLS or copy-only native MP4/MKV without changing the source."""
 import argparse
 import bisect
 import ctypes
@@ -75,11 +75,12 @@ def number(value):
     return result
 
 
-def packet_rows(binary, source, stream=None, feeder=None):
+def packet_rows(binary, source, stream=None, feeder=None, side_data=False):
     """Stream packet records; never retain a movie-sized probe response in memory."""
     command = [binary, "-v", "error", "-protocol_whitelist", "file,pipe",
                "-show_packets", "-show_data_hash", "sha256",
-               "-show_entries", "packet=pts_time,dts_time,duration_time,data_hash,flags,stream_index,pos:packet_side_data=",
+               "-show_entries", "packet=pts_time,dts_time,duration_time,data_hash,flags,stream_index,pos:" +
+               ("packet_side_data=skip_samples,discard_padding" if side_data else "packet_side_data="),
                "-of", "compact=p=0:nk=0"]
     if stream:
         command += ["-select_streams", stream]
@@ -347,6 +348,145 @@ def validate_video_properties(source_video, video):
             raise PreparationError("video color metadata changed")
 
 
+def validate_audio_properties(source_audio, audio):
+    for field in ("codec_name", "profile", "channels", "sample_rate", "extradata_hash"):
+        if source_audio.get(field) != audio.get(field):
+            raise PreparationError("copied audio properties or configuration changed")
+    layout = source_audio.get("channel_layout")
+    if layout not in (None, "unknown", "unspecified") and layout != audio.get("channel_layout"):
+        raise PreparationError("audio channel layout changed")
+
+
+def native_details(video, audios, codecs):
+    pixels = video.get("pix_fmt", "")
+    depth = re.search(r"(?:p|gray)(10|12|14|16)(?:le|be)?$", pixels)
+    bit_depth = int(depth[1]) if depth else int(video.get("bits_per_raw_sample", 0) or 0)
+    if not bit_depth and pixels in ("yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "gbrp", "gray", "nv12", "nv21"):
+        bit_depth = 8
+    return {"video_codec": video["codec_name"], "audio_codec": audios[0]["codec_name"] if audios else "",
+            "audio_channels": int(audios[0]["channels"]) if audios else 0,
+            "audio_sample_rate": int(audios[0]["sample_rate"]) if audios else 0,
+            "video_profile": video.get("profile", ""), "video_level": int(video.get("level", 0)),
+            "video_bit_depth": bit_depth,
+            "color_transfer": video.get("color_transfer", ""),
+            "codecs": codecs, "audio_transcoded": False}
+
+
+def decoded_audio_hash(ffmpeg, source, start=None):
+    command = [ffmpeg, "-v", "error", "-xerror", "-nostdin", "-protocol_whitelist", "file,pipe"]
+    if start is not None:
+        command += ["-ss", str(start)]
+    command += ["-i", str(source), "-map", "0:a:0"]
+    if start is not None:
+        command += ["-t", "2"]
+    # f64 retains every admitted decoder's integer/float sample precision. Use
+    # default container priming/trimming and decoder noise, never skip_manual.
+    command += ["-c:a", "pcm_f64le", "-f", "hash", "-hash", "sha256", "pipe:1"]
+    digest = run(command).strip()
+    if not re.fullmatch(rb"SHA256=[0-9a-fA-F]{64}", digest):
+        raise PreparationError("decoded audio hash is unavailable")
+    return digest
+
+
+def validate_mkv(directory, source, source_info, ffmpeg, ffprobe, mkvinfo, resume=None):
+    file = directory / "stream.mkv"
+    if file.is_symlink() or not file.is_file() or not file.stat().st_size:
+        raise PreparationError("missing or unsafe MKV asset")
+    # Let the installed native inspector parse EBML; no second container parser.
+    structure = run([mkvinfo, "--ui-language", "en_US", "--positions", str(file)]).decode("utf-8")
+    cues = re.findall(r"^\|\+ Cues[^\r\n]* at ([0-9]+)$", structure, re.MULTILINE)
+    clusters = re.findall(r"^\|\+ Cluster at ([0-9]+)$", structure, re.MULTILINE)
+    if len(cues) != 1 or len(clusters) != 1 or not 0 < int(cues[0]) < int(clusters[0]) < file.stat().st_size:
+        raise PreparationError("MKV cues must precede the first media cluster")
+    info = probe(ffprobe, file)
+    if "matroska" not in info.get("format", {}).get("format_name", "").split(","):
+        raise PreparationError("prepared MKV is not a Matroska container")
+    source_video = next(s for s in source_info["streams"] if s.get("codec_type") == "video")
+    source_audio = next((s for s in source_info["streams"] if s.get("codec_type") == "audio"), None)
+    videos = [s for s in info["streams"] if s.get("codec_type") == "video"]
+    audios = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+    if len(videos) != 1 or len(audios) != bool(source_audio) or len(info["streams"]) != 1 + bool(source_audio):
+        raise PreparationError("unexpected prepared stream selection")
+    video = videos[0]
+    validate_video_properties(source_video, video)
+    configuration = source_video.get("extradata_hash", "")
+    if not re.fullmatch(r"SHA256:[0-9a-fA-F]{64}", configuration) or configuration != video.get("extradata_hash"):
+        raise PreparationError("copied video codec configuration changed or is unavailable")
+    if source_audio:
+        validate_audio_properties(source_audio, audios[0])
+    origin = number(source_info.get("format", {}).get("start_time", 0))
+    shift, video_first, video_end = None, None, None
+    for selector in ("v:0", "a:0") if source_audio else ("v:0",):
+        original = packet_rows(ffprobe, source, selector, side_data=True)
+        prepared = packet_rows(ffprobe, file, selector, side_data=True)
+        old_first, new_first, old_end, new_end, count = None, None, None, None, 0
+        previous_old_dts, previous_new_dts = None, None
+        try:
+            for old_packet, new_packet in itertools.zip_longest(packet_durations(original), packet_durations(prepared)):
+                if old_packet is None or new_packet is None:
+                    raise PreparationError("copied packet count changed")
+                old, old_duration = old_packet
+                new, new_duration = new_packet
+                if old["data_hash"] != new["data_hash"] or old.get("flags") != new.get("flags"):
+                    raise PreparationError("compressed packet payload or decode order changed")
+                old_pts, new_pts = number(old.get("pts_time")), number(new.get("pts_time"))
+                if shift is None:
+                    shift = new_pts - (old_pts - origin)
+                    if abs(shift) > 0.25:
+                        raise PreparationError("video timestamp origin changed")
+                if abs(new_pts - (old_pts - origin + shift)) > 0.002:
+                    raise PreparationError("copied packet presentation timing changed")
+                old_dts, new_dts = old.get("dts_time"), new.get("dts_time")
+                if old_dts in (None, "N/A") or new_dts in (None, "N/A"):
+                    if old_dts not in (None, "N/A") or new_dts not in (None, "N/A"):
+                        raise PreparationError("copied decode timestamp availability changed")
+                else:
+                    old_dts, new_dts = number(old_dts), number(new_dts)
+                    if (abs(new_dts - (old_dts - origin + shift)) > 0.002 or
+                            (previous_old_dts is not None and old_dts <= previous_old_dts) or
+                            (previous_new_dts is not None and new_dts <= previous_new_dts)):
+                        raise PreparationError("copied packet decode timing changed")
+                    previous_old_dts, previous_new_dts = old_dts, new_dts
+                if abs(new_duration - old_duration) > 0.002:
+                    raise PreparationError("copied packet duration changed")
+                for field in ("skip_samples", "discard_padding"):
+                    if int(old.get(field, 0)) != int(new.get(field, 0)):
+                        raise PreparationError("copied packet sample trimming changed")
+                old_first = old_pts if old_first is None else min(old_first, old_pts)
+                new_first = new_pts if new_first is None else min(new_first, new_pts)
+                old_end = old_pts + old_duration if old_end is None else max(old_end, old_pts + old_duration)
+                new_end = new_pts + new_duration if new_end is None else max(new_end, new_pts + new_duration)
+                count += 1
+        finally:
+            original.close()
+            prepared.close()
+        if not count:
+            raise PreparationError("empty prepared stream")
+        if (abs(new_first - (old_first - origin + shift)) > 0.002 or
+                abs(new_end - (old_end - origin + shift)) > 0.002):
+            raise PreparationError("copied stream end or audio/video synchronization changed")
+        if selector == "v:0":
+            video_first, video_end = old_first, old_end
+    if source_audio:
+        if decoded_audio_hash(ffmpeg, source) != decoded_audio_hash(ffmpeg, file):
+            raise PreparationError("full default decoded audio changed")
+        duration = video_end - origin
+        starts = {max(0, (video_first + video_end) / 2 - origin), max(0, duration - 2)}
+        if resume is not None:
+            if not 0 <= resume < duration:
+                raise PreparationError("resume point is outside the source timeline")
+            starts.add(resume)
+        # Identical AC3 packets can still produce different seek PCM when a
+        # demuxer supplies different preroll to the persistent dither generator.
+        # The original, not a previously remuxed MP4, is the consumer baseline.
+        for start in sorted(starts):
+            if decoded_audio_hash(ffmpeg, source, start) != decoded_audio_hash(ffmpeg, file, start):
+                raise PreparationError("default resumed decoded audio changed")
+    elif resume is not None and not 0 <= resume < video_end - origin:
+        raise PreparationError("resume point is outside the source timeline")
+    return native_details(video, audios, ""), 1
+
+
 def read_faststart(file):
     if file.is_symlink() or not file.is_file() or not file.stat().st_size:
         raise PreparationError("missing or unsafe MP4 asset")
@@ -448,12 +588,7 @@ def validate_mp4(directory, source, source_info, ffmpeg, ffprobe):
         raise PreparationError("video end changed")
     if source_audio:
         audio = audios[0]
-        for field in ("codec_name", "profile", "channels", "sample_rate", "extradata_hash"):
-            if source_audio.get(field) != audio.get(field):
-                raise PreparationError("copied audio properties or configuration changed")
-        layout = source_audio.get("channel_layout")
-        if layout not in (None, "unknown", "unspecified") and layout != audio.get("channel_layout"):
-            raise PreparationError("audio channel layout changed")
+        validate_audio_properties(source_audio, audio)
         old_rows, new_rows = packet_rows(ffprobe, source, "a:0"), packet_rows(ffprobe, file, "a:0")
         try:
             for old_packet, new_packet in itertools.zip_longest(packet_durations(old_rows), packet_durations(new_rows)):
@@ -480,18 +615,7 @@ def validate_mp4(directory, source, source_info, ffmpeg, ffprobe):
             codecs += ",mp4a.40.2"
         else:
             codecs = ""
-    pixels = video.get("pix_fmt", "")
-    depth = re.search(r"(?:p|gray)(10|12|14|16)(?:le|be)?$", pixels)
-    bit_depth = int(depth[1]) if depth else int(video.get("bits_per_raw_sample", 0) or 0)
-    if not bit_depth and pixels in ("yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "gbrp", "gray", "nv12", "nv21"):
-        bit_depth = 8
-    return {"video_codec": video["codec_name"], "audio_codec": audios[0]["codec_name"] if audios else "",
-            "audio_channels": int(audios[0]["channels"]) if audios else 0,
-            "audio_sample_rate": int(audios[0]["sample_rate"]) if audios else 0,
-            "video_profile": video.get("profile", ""), "video_level": int(video.get("level", 0)),
-            "video_bit_depth": bit_depth,
-            "color_transfer": video.get("color_transfer", ""),
-            "codecs": codecs, "audio_transcoded": False}, 1
+    return native_details(video, audios, codecs), 1
 
 
 def validate_package(directory, source, source_info, ffmpeg, ffprobe, transcoded, rewrite=False):
@@ -648,7 +772,11 @@ def publish(directory, output):
 
 def prepare(args):
     raw_source, raw_output = Path(args.source), Path(args.output)
-    native = getattr(args, "format", "hls") == "mp4"
+    format = getattr(args, "format", "hls")
+    native = format in ("mp4", "mkv")
+    resume = getattr(args, "resume_seconds", None)
+    if resume is not None and format != "mkv":
+        raise PreparationError("resume validation is only supported for MKV preparation")
     for path in (raw_source, raw_output):
         path = path.absolute()
         if any(part.is_symlink() for part in (path, *path.parents)):
@@ -697,7 +825,10 @@ def prepare(args):
             raise PreparationError("invalid existing package metadata") from None
         if not isinstance(recorded, dict) or any(recorded.get(k) != v for k, v in base.items()):
             raise PreparationError("existing package belongs to a different or changed source")
-        if native:
+        if format == "mkv":
+            details, count = validate_mkv(output, source, info, args.ffmpeg, args.ffprobe,
+                                          getattr(args, "mkvinfo", "mkvinfo"), resume)
+        elif native:
             details, count = validate_mp4(output, source, info, args.ffmpeg, args.ffprobe)
         else:
             details, count = validate_package(output, source, info, args.ffmpeg, args.ffprobe, transcoded)
@@ -706,7 +837,7 @@ def prepare(args):
                 fingerprint(source) != before):
             raise PreparationError("existing package or source changed")
         return {"status": "unchanged", **({} if native else {"segments": count}), **details}
-    temporary = Path(tempfile.mkdtemp(prefix=".prepare-mp4-" if native else ".prepare-hls-", dir=output.parent))
+    temporary = Path(tempfile.mkdtemp(prefix=f".prepare-{format}-", dir=output.parent))
     try:
         command = [args.ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-copyts"]
         if not native:
@@ -714,7 +845,7 @@ def prepare(args):
         # Native MP4 edit lists can represent original negative audio preroll.
         # Shifting it to zero can clip the final copied video sample's duration.
         command += ["-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy"]
-        if video["codec_name"] == "hevc":
+        if video["codec_name"] == "hevc" and format != "mkv":
             command += ["-tag:v", "hvc1"]
         if audio:
             command += ["-c:a", "aac" if transcoded else "copy"]
@@ -723,7 +854,10 @@ def prepare(args):
                 if audio.get("channel_layout") == "5.1(side)":
                     command += ["-af", "pan=5.1|FL=FL|FR=FR|FC=FC|LFE=LFE|BL=SL|BR=SR"]
         command += ["-avoid_negative_ts", "disabled"]
-        if native:
+        if format == "mkv":
+            command += ["-map_chapters", "-1", "-max_interleave_delta", "0", "-cues_to_front", "1",
+                        "-f", "matroska", str(temporary / "stream.mkv")]
+        elif native:
             # Native FLAC-in-MP4 is supported by FFmpeg behind this muxer flag;
             # every stream remains copy-only, including AAC with a PCE.
             # Default chapter copying synthesizes a bin_data/text track even
@@ -740,7 +874,10 @@ def prepare(args):
                         "-hls_segment_filename", str(temporary / "seg_%05d.m4s"),
                         str(temporary / "index.m3u8")]
         run(command)
-        if native:
+        if format == "mkv":
+            details, count = validate_mkv(temporary, source, info, args.ffmpeg, args.ffprobe,
+                                          getattr(args, "mkvinfo", "mkvinfo"), resume)
+        elif native:
             details, count = validate_mp4(temporary, source, info, args.ffmpeg, args.ffprobe)
         else:
             details, count = validate_package(temporary, source, info, args.ffmpeg, args.ffprobe, transcoded, rewrite=True)
@@ -776,6 +913,16 @@ def prepare(args):
             shutil.rmtree(temporary)
 
 
+def resume_seconds(value):
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("resume seconds must be a finite nonnegative number") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("resume seconds must be a finite nonnegative number")
+    return seconds
+
+
 def segment_seconds(value):
     try:
         seconds = float(value)
@@ -790,10 +937,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--format", choices=("hls", "mp4"), default="hls")
+    parser.add_argument("--format", choices=("hls", "mp4", "mkv"), default="hls")
+    parser.add_argument("--resume-seconds", type=resume_seconds,
+                        help="add the known resume point to MKV default decoded-audio validation")
     parser.add_argument("--segment-seconds", type=segment_seconds, default=2.0)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
+    parser.add_argument("--mkvinfo", default="mkvinfo", help="native front-cues inspector required for MKV")
     args = parser.parse_args(argv)
     def interrupted(signum, frame):
         raise KeyboardInterrupt
