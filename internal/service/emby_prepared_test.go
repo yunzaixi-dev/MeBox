@@ -1,9 +1,14 @@
 package service
 
 import (
-	"github.com/truewhile/MeBox/internal/model"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/truewhile/MeBox/internal/model"
 )
 
 func TestEmbyPreparedNegotiationRespectsClientLimits(t *testing.T) {
@@ -103,6 +108,71 @@ func TestEmbyPreparedHLSRequiresFragmentedMP4AndExternalSubtitleSupport(t *testi
 	request.SubtitleStreamIndex = new(-1)
 	if !preparedClientSupports(request, media, metadata, true, subtitles) {
 		t.Fatal("explicitly disabled subtitles prevented prebuilt playback")
+	}
+}
+
+func TestEmbyPreparedHLSFallbackKeepsNativeAudioMetadata(t *testing.T) {
+	_, cfg, repos, _, directory := preparedMP4Fixture(t)
+	media, err := repos.Media.FindByID(t.Context(), "prepared-mp4-test")
+	if err != nil || media == nil {
+		t.Fatalf("media: %v", err)
+	}
+	native, _, err := preparedMP4(cfg, media)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media.AudioCodec = "flac"
+	native.AudioCodec, native.Codecs = "flac", ""
+	data, err := json.Marshal(native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "source.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hls := preparedHLSMetadata{
+		Version: 1, SourceSize: native.SourceSize, SourceMtimeNS: native.SourceMtimeNS,
+		VideoCodec: "h264", AudioCodec: "aac",
+		preparedHLSInfo: preparedHLSInfo{Codecs: "avc1.640028,mp4a.40.2", AudioTranscoded: true},
+	}
+	data, err = json.Marshal(hls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory = filepath.Join(cfg.Cache.CacheDir, "prepared-hls", media.ID)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{"source.json": data, "index.m3u8": []byte("#EXTM3U\n"), "init.mp4": []byte("init")} {
+		if err := os.WriteFile(filepath.Join(directory, name), body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := NewEmbyService(cfg, nil, repos)
+	for _, tc := range []struct {
+		container, source, codec string
+	}{{"ts", ":mp4", "flac"}, {"mp4", ":hls", "aac"}} {
+		t.Run(tc.container, func(t *testing.T) {
+			request := model.EmbyPlaybackInfoRequest{DeviceProfile: &model.EmbyDeviceProfile{
+				DirectPlayProfiles:  []model.EmbyDirectPlayProfile{{Type: "Video", Container: "mp4", VideoCodec: "h264", AudioCodec: "flac"}},
+				TranscodingProfiles: []model.EmbyTranscodingProfile{{Type: "Video", Protocol: "hls", Container: tc.container, VideoCodec: "h264", AudioCodec: "aac"}},
+			}}
+			sources := svc.playbackMediaSources(t.Context(), media, request)
+			if len(sources) != 1 || sources[0]["Id"] != media.ID || !strings.Contains(sources[0]["DirectStreamUrl"].(string), "MediaSourceId="+media.ID+tc.source) {
+				t.Fatalf("selected source: %#v", sources)
+			}
+			audio := sources[0]["MediaStreams"].([]map[string]any)[1]
+			if audio["Codec"] != tc.codec || audio["Channels"] != 2 || media.AudioCodec != "flac" {
+				t.Fatalf("audio metadata changed: %#v, original=%s", audio, media.AudioCodec)
+			}
+			if tc.source == ":mp4" {
+				if audio["SampleRate"] != 48000 || audio["Profile"] != nil {
+					t.Fatalf("native audio inherited HLS metadata: %#v", audio)
+				}
+			} else if audio["SampleRate"] != nil || !strings.Contains(sources[0]["Name"].(string), "AAC 兼容音频") {
+				t.Fatalf("converted audio metadata/disclosure: %#v", sources[0])
+			}
+		})
 	}
 }
 

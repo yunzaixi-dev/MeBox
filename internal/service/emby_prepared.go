@@ -11,16 +11,84 @@ import (
 )
 
 func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, request model.EmbyPlaybackInfoRequest) []map[string]any {
-	originals := e.mediaSourcesForItem(ctx, m, false, e.directPlayOnly(ctx))
 	// An explicit original or other track remains an original-file request.
 	if request.MediaSourceId == m.ID || (request.AudioStreamIndex != nil && *request.AudioStreamIndex != 1) {
-		return originals
+		return e.mediaSourcesForItem(ctx, m, false, e.directPlayOnly(ctx))
 	}
-	variants := make([]map[string]any, 0, 2)
-	preferred := -1
+	automatic := request.MediaSourceId == ""
+	wantMP4 := request.MediaSourceId == m.ID+":mp4" || automatic && request.DeviceProfile != nil && len(request.DeviceProfile.DirectPlayProfiles) > 0
+	wantHLS := request.MediaSourceId == m.ID+":hls" || automatic && request.DeviceProfile != nil && len(request.DeviceProfile.TranscodingProfiles) > 0
+	if automatic && request.EnableDirectPlay != nil && !*request.EnableDirectPlay && request.EnableDirectStream != nil && !*request.EnableDirectStream {
+		wantMP4 = false
+	}
+	if automatic && request.EnableDirectStream != nil && !*request.EnableDirectStream && request.EnableTranscoding != nil && !*request.EnableTranscoding {
+		wantHLS = false
+	}
 	var nativeDetails *preparedMP4Metadata
-	if metadata, _, err := preparedMP4(e.cfg, m); err == nil {
-		nativeDetails = metadata
+	if wantMP4 || wantHLS {
+		// HLS uses the native package's decoder metadata even when MP4 is not offered.
+		nativeDetails, _, _ = preparedMP4(e.cfg, m)
+	}
+	// Try HLS first: a compatible HLS source always wins automatic negotiation.
+	if wantHLS {
+		if metadata, _, err := preparedHLS(e.cfg, m); err == nil {
+			url := "/Videos/" + m.ID + "/master.m3u8?quality=prepared&MediaSourceId=" + m.ID + ":hls"
+			prepared := *m
+			prepared.AudioCodec = metadata.AudioCodec
+			src := e.baseMediaSource(ctx, &prepared, "mp4", false, url, true)
+			src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":hls", MediaVersionLabel(*m)+" · 原画分片 VOD", url
+			src["Path"], src["IsRemote"] = url, true
+			if metadata.AudioTranscoded {
+				src["Name"] = src["Name"].(string) + " · AAC 兼容音频"
+			}
+			src["SupportsProbing"] = false
+			src["SupportsDirectPlay"], src["SupportsDirectStream"], src["SupportsTranscoding"] = false, true, true
+			src["TranscodingUrl"], src["TranscodingContainer"], src["TranscodingSubProtocol"] = url, "mp4", "hls"
+			if request.EnableDirectStream != nil {
+				src["SupportsDirectStream"] = *request.EnableDirectStream
+			}
+			if request.EnableTranscoding != nil {
+				src["SupportsTranscoding"] = *request.EnableTranscoding
+			}
+			delete(src, "Size")
+			if request.SubtitleStreamIndex != nil {
+				src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
+			}
+			native := preparedMP4Metadata{VideoCodec: metadata.VideoCodec, AudioCodec: metadata.AudioCodec}
+			if nativeDetails != nil {
+				native.AudioChannels, native.AudioSampleRate = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
+				native.VideoProfile, native.VideoLevel, native.VideoBitDepth = nativeDetails.VideoProfile, nativeDetails.VideoLevel, nativeDetails.VideoBitDepth
+				native.ColorTransfer = nativeDetails.ColorTransfer
+				if metadata.AudioTranscoded {
+					native.AudioSampleRate = 0
+				}
+			}
+			for _, stream := range src["MediaStreams"].([]map[string]any) {
+				if stream["Type"] == "Video" && nativeDetails != nil {
+					stream["BitDepth"], stream["Profile"], stream["Level"] = native.VideoBitDepth, native.VideoProfile, native.VideoLevel
+				}
+				if stream["Type"] == "Audio" {
+					stream["Profile"] = "LC"
+					if native.AudioChannels > 0 {
+						stream["Channels"] = native.AudioChannels
+					}
+					if native.AudioSampleRate > 0 {
+						stream["SampleRate"] = native.AudioSampleRate
+					}
+				}
+			}
+			if !automatic {
+				return []map[string]any{src}
+			}
+			if preparedClientSupports(request, m, &native, true, src["MediaStreams"].([]map[string]any)) {
+				perftrace.Count(ctx, "playback.prepared_hls.selected")
+				// Automatic negotiation keeps the item identity, not an alternative-source ID.
+				src["Id"] = m.ID
+				return []map[string]any{src}
+			}
+		}
+	}
+	if wantMP4 && nativeDetails != nil {
 		url := embyDirectStreamURL(m.ID, "mp4") + "?MediaSourceId=" + m.ID + ":mp4"
 		src := e.baseMediaSource(ctx, m, "mp4", false, url, true)
 		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":mp4", MediaVersionLabel(*m)+" · 原画原音轨快速 MP4", url
@@ -35,97 +103,34 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		if request.SubtitleStreamIndex != nil {
 			src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
 		}
-		src["Size"] = metadata.asset.Size()
+		src["Size"] = nativeDetails.asset.Size()
 		streams := src["MediaStreams"].([]map[string]any)
 		for _, stream := range streams {
 			if stream["Type"] == "Video" {
-				stream["BitDepth"], stream["Profile"], stream["Level"] = metadata.VideoBitDepth, metadata.VideoProfile, metadata.VideoLevel
+				stream["BitDepth"], stream["Profile"], stream["Level"] = nativeDetails.VideoBitDepth, nativeDetails.VideoProfile, nativeDetails.VideoLevel
 			}
 			if stream["Type"] == "Audio" {
-				stream["Channels"], stream["SampleRate"] = metadata.AudioChannels, metadata.AudioSampleRate
+				stream["Channels"], stream["SampleRate"] = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
 			}
 		}
-		if preparedClientSupports(request, m, metadata, false, streams) {
-			preferred = 0
+		if !automatic {
+			return []map[string]any{src}
 		}
-		variants = append(variants, src)
+		if preparedClientSupports(request, m, nativeDetails, false, streams) {
+			perftrace.Count(ctx, "playback.prepared_mp4.selected")
+			src["Id"] = m.ID
+			return []map[string]any{src}
+		}
 	}
-	if metadata, _, err := preparedHLS(e.cfg, m); err == nil {
-		url := "/Videos/" + m.ID + "/master.m3u8?quality=prepared&MediaSourceId=" + m.ID + ":hls"
-		prepared := *m
-		prepared.AudioCodec = metadata.AudioCodec
-		src := e.baseMediaSource(ctx, &prepared, "mp4", false, url, true)
-		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":hls", MediaVersionLabel(*m)+" · 原画分片 VOD", url
-		src["Path"], src["IsRemote"] = url, true
-		if metadata.AudioTranscoded {
-			src["Name"] = src["Name"].(string) + " · AAC 兼容音频"
-		}
-		src["SupportsProbing"] = false
-		src["SupportsDirectPlay"], src["SupportsDirectStream"], src["SupportsTranscoding"] = false, true, true
-		src["TranscodingUrl"], src["TranscodingContainer"], src["TranscodingSubProtocol"] = url, "mp4", "hls"
-		if request.EnableDirectStream != nil {
-			src["SupportsDirectStream"] = *request.EnableDirectStream
-		}
-		if request.EnableTranscoding != nil {
-			src["SupportsTranscoding"] = *request.EnableTranscoding
-		}
-		delete(src, "Size")
-		if request.SubtitleStreamIndex != nil {
-			src["DefaultSubtitleStreamIndex"] = *request.SubtitleStreamIndex
-		}
-		native := preparedMP4Metadata{VideoCodec: metadata.VideoCodec, AudioCodec: metadata.AudioCodec}
-		if nativeDetails != nil {
-			native.AudioChannels, native.AudioSampleRate = nativeDetails.AudioChannels, nativeDetails.AudioSampleRate
-			native.VideoProfile, native.VideoLevel, native.VideoBitDepth = nativeDetails.VideoProfile, nativeDetails.VideoLevel, nativeDetails.VideoBitDepth
-			native.ColorTransfer = nativeDetails.ColorTransfer
-			if metadata.AudioTranscoded {
-				native.AudioSampleRate = 0
-			}
-		}
-		for _, stream := range src["MediaStreams"].([]map[string]any) {
-			if stream["Type"] == "Video" && nativeDetails != nil {
-				stream["BitDepth"], stream["Profile"], stream["Level"] = native.VideoBitDepth, native.VideoProfile, native.VideoLevel
-			}
-			if stream["Type"] == "Audio" {
-				stream["Profile"] = "LC"
-				if native.AudioChannels > 0 {
-					stream["Channels"] = native.AudioChannels
-				}
-				if native.AudioSampleRate > 0 {
-					stream["SampleRate"] = native.AudioSampleRate
-				}
-			}
-		}
-		if preparedClientSupports(request, m, &native, true, src["MediaStreams"].([]map[string]any)) {
-			preferred = len(variants)
-		}
-		variants = append(variants, src)
-	}
-	if request.MediaSourceId != "" {
-		for _, src := range variants {
-			if src["Id"] == request.MediaSourceId {
-				return []map[string]any{src}
-			}
-		}
+	// Enumerate original versions only when no prepared source was selected.
+	originals := e.mediaSourcesForItem(ctx, m, false, e.directPlayOnly(ctx))
+	if !automatic {
 		for _, src := range originals {
 			if src["Id"] == request.MediaSourceId {
 				return []map[string]any{src}
 			}
 		}
 		return nil
-	}
-	// Unknown capability is not permission to change the client's default format.
-	if preferred >= 0 {
-		selected := variants[preferred]
-		if selected["Id"] == m.ID+":hls" {
-			perftrace.Count(ctx, "playback.prepared_hls.selected")
-		} else {
-			perftrace.Count(ctx, "playback.prepared_mp4.selected")
-		}
-		// This is an automatic negotiation, not a list of alternatives for the
-		// client to reselect. Explicit source/track requests above stay unchanged.
-		selected["Id"] = m.ID
-		return []map[string]any{selected}
 	}
 	perftrace.Count(ctx, "playback.original.selected")
 	return originals

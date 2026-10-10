@@ -163,6 +163,7 @@ Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同
 明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；只有原生 MP4 能力或明确选择原音轨 MP4 时，使用原 ID 下的 faststart copy-only MP4。音频转换在来源名称明确标记。
 未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。显式选择和自动默认的字幕都需要客户端支持现有外挂交付，不自动烧录；明确关闭字幕不阻止 prepared。
 自动协商命中 prepared 时只返回这一个可用表示，默认 `MediaSources[].Id` 保留从条目选择的原逻辑来源 ID，真实表示由带明确资源 selector 的 URL 指定；不再把另一个可直接播放的原版候选放进同一自动响应让客户端重新选回。没有可用能力则仅返回原来源，未通过条件的 prepared 不作为自动候选。明确 `MediaSourceId=<原 ID>`／其他音轨仍请求原文件；明确 `:<mp4|hls>` 仍请求对应 prepared 资源，版本和历史身份不重建。
+协商按需构建来源：兼容 HLS 命中后不再构建未使用的 MP4，prepared 命中后不再枚举／构建原版本；只有回退或明确原版选择才查询原版本。没有跨请求缓存，不跳过源 fingerprint、能力／字幕校验或文件权限检查；这降低的是服务器协商开销，不是已证明的设备首帧提速。
 `TranscodingProfile.MaxAudioChannels` 遵循 Emby schema 的字符串契约；非空上限必须为有效正整数且匹配实际音轨，否则不选 prepared。离线播放不消费 `MinSegments`，因此不为它建立强类型绑定：Hills 的 `"MinSegments":"1"` 不应阻断 PlaybackInfo，实际用于权限／选源的字段校验仍保留。
 prepared MP4／HLS 的 `Protocol=Http`、`IsRemote=true` 与 `Path` 指向同一个带鉴权的真实播放端点；不再把原 MKV 文件路径放进 MP4 来源。遵循 HTTP `Path` 的客户端可直接消费已协商资源，原版来源身份／路径和明确音轨选择不变。不会把 MP4 字节伪装成 MKV，也不在缺少设备身份的原版拉流请求上猜测账号内其他设备的能力。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
