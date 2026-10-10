@@ -122,14 +122,13 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		} else {
 			perftrace.Count(ctx, "playback.prepared_mp4.selected")
 		}
-		variants = append(variants[:preferred], variants[preferred+1:]...)
-		out := make([]map[string]any, 0, 1+len(originals)+len(variants))
-		out = append(out, selected)
-		out = append(out, originals...)
-		return append(out, variants...)
+		// This is an automatic negotiation, not a list of alternatives for the
+		// client to reselect. Explicit source/track requests above stay unchanged.
+		selected["Id"] = m.ID
+		return []map[string]any{selected}
 	}
 	perftrace.Count(ctx, "playback.original.selected")
-	return append(originals, variants...)
+	return originals
 }
 
 func codecListContains(list, codec string) bool {

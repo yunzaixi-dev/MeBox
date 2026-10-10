@@ -62,10 +62,16 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 				if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &result) != nil {
 					t.Fatalf("playback: %d %s", response.Code, response.Body.String())
 				}
-				if len(result.MediaSources) != 2 || result.MediaSources[0]["Id"] != "media-1:mp4" || result.MediaSources[1]["Id"] != "media-1" {
-					t.Fatalf("optimized/default/original negotiation: %#v", result.MediaSources)
+				var selected map[string]any
+				for _, candidate := range result.MediaSources {
+					if candidate["Id"] == "media-1" {
+						selected = candidate
+					}
 				}
-				direct := result.MediaSources[0]["Path"].(string)
+				if selected == nil {
+					t.Fatal("automatic negotiation lost the source identity selected from item details")
+				}
+				direct := selected["Path"].(string)
 				uri, err := url.Parse(direct)
 				if err != nil {
 					t.Fatal(err)
@@ -79,6 +85,15 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 				router.ServeHTTP(body, get)
 				if body.Code != 206 || body.Body.String() != "fast" {
 					t.Fatalf("MP4 variant did not serve exact prepared range: %d %q", body.Code, body.Body.String())
+				}
+				for _, candidate := range result.MediaSources[1:] {
+					get := httptest.NewRequest(http.MethodGet, "/emby"+candidate["DirectStreamUrl"].(string), nil)
+					get.Header.Set("Range", "bytes=0-3")
+					body := httptest.NewRecorder()
+					router.ServeHTTP(body, get)
+					if body.Code != 206 || body.Body.String() != "fast" {
+						t.Fatalf("automatic negotiation offered a path outside the declared MP4 capability: %d %q", body.Code, body.Body.String())
+					}
 				}
 			})
 		}
@@ -135,7 +150,7 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		t.Fatalf("HLS negotiation: %d %s", response.Code, response.Body.String())
 	}
 	hls := hlsResult.MediaSources[0]
-	if hls["Id"] != "media-1:hls" || hls["SupportsDirectPlay"] != false || hls["SupportsDirectStream"] != false || hls["SupportsTranscoding"] != true {
+	if hls["SupportsDirectPlay"] != false || hls["SupportsDirectStream"] != false || hls["SupportsTranscoding"] != true {
 		t.Fatalf("client's HLS-only selection ignored: %#v", hls)
 	}
 	streams := hls["MediaStreams"].([]any)
@@ -184,8 +199,9 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 		if query != "" {
 			want = "media-1:mp4"
 		}
-		if result.MediaSources[0]["Id"] != want {
-			t.Fatalf("negotiation ignored capabilities, disabled paths or explicit original audio: %v", result.MediaSources[0]["Id"])
+		uri, err := url.Parse(result.MediaSources[0]["DirectStreamUrl"].(string))
+		if err != nil || uri.Query().Get("MediaSourceId") != want {
+			t.Fatalf("negotiation ignored capabilities, disabled paths or explicit original audio: %v", result.MediaSources[0]["DirectStreamUrl"])
 		}
 	}
 }
