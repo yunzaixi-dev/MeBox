@@ -5,9 +5,11 @@ FROM ${AMS_BASE_IMAGE}
 ARG AMS_BASE_IMAGE
 ARG REVISION
 ARG PERFORMANCE_TRACE=false
+ARG USER_REQUEST_LOG=false
 LABEL org.opencontainers.image.source="https://github.com/yunzaixi-dev/MeBox" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.base.name="${AMS_BASE_IMAGE}"
 ENV MEBOX_PERFORMANCE_TRACE=${PERFORMANCE_TRACE}
+ENV MEBOX_USER_REQUEST_LOG=${USER_REQUEST_LOG}
 COPY --chmod=755 mebox /usr/local/bin/mebox
 COPY web/dist /app/web/dist

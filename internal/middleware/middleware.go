@@ -5,6 +5,7 @@ package middleware
 // Context keys for values produced by the auth middleware.
 const (
 	CtxUserID       = "ctx_user_id"
+	CtxUserName     = "ctx_user_name"
 	CtxUserRole     = "ctx_user_role"
 	CtxUserTier     = "ctx_user_tier"
 	CtxTokenPurpose = "ctx_token_purpose"

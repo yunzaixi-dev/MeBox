@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -135,4 +138,41 @@ func embyCompatLogPath(cfg *config.Config) string {
 		return base + ".emby-compat" + ext
 	}
 	return filepath.Join(out, "emby-compat.log")
+}
+
+// newUserRequestLogger is independent of ordinary log levels and never writes plaintext requests to stdout.
+func newUserRequestLogger(cfg *config.Config) (*zap.Logger, func(), error) {
+	raw := os.Getenv("MEBOX_USER_REQUEST_LOG")
+	if raw == "" {
+		return nil, nil, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid MEBOX_USER_REQUEST_LOG: %w", err)
+	}
+	if !enabled {
+		return nil, nil, nil
+	}
+	dir := filepath.Join(cfg.App.DataDir, "logs", "user-requests")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, err
+	}
+	stat, err := os.Lstat(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !stat.IsDir() || stat.Mode()&os.ModeSymlink != 0 {
+		return nil, nil, fmt.Errorf("private request log directory is not a directory")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, nil, err
+	}
+	writer := &rotatingFileWriter{path: filepath.Join(dir, "requests.jsonl"), maxSize: 100 << 20, maxBackups: 10, maxAge: 14 * 24 * time.Hour, mode: 0o600}
+	if err := writer.open(); err != nil {
+		return nil, nil, err
+	}
+	encoder := zap.NewProductionEncoderConfig()
+	encoder.EncodeTime = zapcore.ISO8601TimeEncoder
+	log := zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(encoder), writer, zap.InfoLevel), zap.ErrorOutput(zapcore.Lock(os.Stderr)))
+	return log, func() { _ = log.Sync(); _ = writer.Close() }, nil
 }

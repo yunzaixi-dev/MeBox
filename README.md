@@ -94,6 +94,31 @@
 `http.response_ready` 是应用准备提交响应的时间，**不是客户端 TTFB**；边缘缓存命中还可能复用旧响应里的请求 ID。
 必须把真实客户端的 TTFB、持续 Range 读取、Nginx／Tunnel 和主机观测一起比对，不能仅看服务端总耗时判断卡顿。
 
+#### 按用户名记录详细业务请求
+
+设置 `MEBOX_USER_REQUEST_LOG=true` 后，所有完成的 HTTP 请求（含失败、匿名、静态资源和健康检查）单独写入
+`<app.data_dir>/logs/user-requests/requests.jsonl`；AMS 容器为 `/data/logs/user-requests/requests.jsonl`。
+默认关闭，与 `MEBOX_PERFORMANCE_TRACE` 独立；不会写到 stdout 或普通应用日志，普通日志级别不影响采集。
+`Dockerfile.ams` 用 `USER_REQUEST_LOG=true` 显式启用。目录 `0700`、活动与轮转文件 `0600`，拒绝目录／文件软链接。
+
+- `user_id` 和 `username` 来自已认证账号及数据库用户记录，不信任客户端提交的用户名或 `UserId`。API／Emby
+  复用已有账号查询；未查询用户的管理路由仅补一次只读查找，不增加用户名缓存或修改 JWT。成功登录／注册也关联真实账号。
+  `username_state=known/anonymous/unavailable` 区分已解析、匿名、数据库不可用／用户已不存在；不可用时保留真实 ID，不猜名字。
+- 保存原始／归一化路径、重复 query 值、脱敏请求头、客户端／设备／会话／profile、业务正文、状态、响应头／字节数、耗时与取消。
+  `request_id` 对应服务端 `X-Request-ID`，开启性能追踪时与 trace 同 ID；Emby 大小写重分发不重复记录。
+  `requested_media_source_id` 是请求选项，不冒称实际选源；实际选源计数通过同 ID 的性能 trace 关联。
+- JSON 保留业务字段和标量类型、大整数精度，例如 `MinSegments="1"`、codec／声道／播放参数；form 同样按字段脱敏。
+  密码／PIN／token／Cookie／Authorization／API key／签名密钥、签名 URL 凭据、敏感 `key/value` 设置及嵌套 JSON 字符串
+  统一脱敏。认证头中的客户端信息另行解析保存；日志不是可直接复用认证凭据的原始网络抓包。
+- 仅被处理器读取的 JSON／form 正文采集，最多 1 MiB，不预读／额外 drain、不改变 handler 收到的字节／读错误。
+  `body_state` 明确标记 `complete`、`empty`、`unread`、`incomplete`、`truncated`、`invalid_json` 或 `unsupported`；读错误另记 `body_read_error`。
+  未读完、超限、畸形、压缩／二进制／multipart 正文不写原始片段，避免截断时漏出凭据。影片、字幕、图片等响应正文从不采集。
+  流式请求在结束／取消时写完成记录，耗时不是客户端首帧或解码性能。
+- 固定每文件 100 MiB、10 份备份（本目录约 1.1 GiB），轮转时清理超过 14 天的备份；不是所有记录严格 14 天 TTL。
+  复用现有同步轮转器，没有队列静默丢弃；运行时磁盘写错误进入 stderr，不能保证磁盘故障时仍有完整日志。
+
+日志包含用户名、观看请求和设备信息，仅供私有运维，不能进入 Git、公开报告或普通日志导出；需要长周期统计时应先生成聚合结果。
+
 AMS 核心与网页更新使用 `Dockerfile.ams`：先构建本 fork 的 `web/dist`，再以 `CGO_ENABLED=0` 构建静态 `mebox`，
 在私有临时 build context 放入二进制、Dockerfile 与 `web/dist`（保持此目录结构）。显式提供 `AMS_BASE_IMAGE`
 为已核验的本地 AMS 基线镜像、`REVISION` 为构建来源 SHA，观测版额外提供 `PERFORMANCE_TRACE=true`。

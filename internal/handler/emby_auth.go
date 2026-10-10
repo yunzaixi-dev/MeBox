@@ -148,7 +148,7 @@ func embyContextUserName(c *gin.Context) string {
 	if c == nil {
 		return ""
 	}
-	if value, ok := c.Get(embyCtxUserName); ok {
+	if value, ok := c.Get(middleware.CtxUserName); ok {
 		if username, ok := value.(string); ok {
 			return strings.TrimSpace(username)
 		}

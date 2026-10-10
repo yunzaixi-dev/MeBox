@@ -41,6 +41,8 @@ func loginHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		c.Set(middleware.CtxUserID, resp.User.ID)
+		c.Set(middleware.CtxUserName, resp.User.Username)
 		if svc.Sessions != nil {
 			svc.Sessions.RecordLogin(c.Request.Context(), resp.User.ID, resp.User.Username, "", "Web", "Web", c.ClientIP())
 		}
@@ -80,6 +82,8 @@ func registerHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		c.Set(middleware.CtxUserID, u.ID)
+		c.Set(middleware.CtxUserName, u.Username)
 		if tokens != nil {
 			setAccessTokenCookie(c, tokens.AccessToken, int(tokens.ExpiresIn))
 		}
@@ -120,9 +124,9 @@ func changePasswordHandler(svc *service.Container) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-			c.Status(http.StatusNoContent)
-		}
+		c.Status(http.StatusNoContent)
 	}
+}
 
 func temporaryPasswordHandler(svc *service.Container) gin.HandlerFunc {
 	return func(c *gin.Context) {

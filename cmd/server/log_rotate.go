@@ -18,6 +18,7 @@ type rotatingFileWriter struct {
 	maxSize    int64
 	maxBackups int
 	maxAge     time.Duration
+	mode       os.FileMode
 	file       *os.File
 	size       int64
 }
@@ -92,9 +93,26 @@ func (w *rotatingFileWriter) Close() error {
 }
 
 func (w *rotatingFileWriter) open() error {
-	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	mode := w.mode
+	if mode == 0 {
+		mode = 0o640
+	}
+	if w.mode != 0 {
+		if stat, err := os.Lstat(w.path); err == nil && !stat.Mode().IsRegular() {
+			return fmt.Errorf("private log is not a regular file")
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, mode)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", w.path, err)
+	}
+	if w.mode != 0 {
+		if err := file.Chmod(mode); err != nil {
+			_ = file.Close()
+			return err
+		}
 	}
 	w.file = file
 	if stat, err := file.Stat(); err == nil {

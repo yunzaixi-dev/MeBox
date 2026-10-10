@@ -20,11 +20,12 @@ import (
 // during startup. Platform entry points decide how the application is
 // controlled: a console signal loop or a Windows notification-area icon.
 type application struct {
-	cfg              *config.Config
-	logger           *zap.Logger
-	embyCompatLogger *zap.Logger
-	serverManager    *serverManager
-	services         *service.Container
+	cfg               *config.Config
+	logger            *zap.Logger
+	embyCompatLogger  *zap.Logger
+	userRequestLogger *zap.Logger
+	serverManager     *serverManager
+	services          *service.Container
 
 	closeMu     sync.Mutex
 	closeFuncs  []func()
@@ -63,6 +64,14 @@ func (a *application) start() error {
 	}
 	a.embyCompatLogger = embyCompatLogger
 	a.addCloser(closeEmbyCompatLogger)
+	userRequestLogger, closeUserRequestLogger, err := newUserRequestLogger(a.cfg)
+	if err != nil {
+		return fmt.Errorf("user request logger init failed: %w", err)
+	}
+	a.userRequestLogger = userRequestLogger
+	if closeUserRequestLogger != nil {
+		a.addCloser(closeUserRequestLogger)
+	}
 
 	appVersion := effectiveVersion(version)
 	a.logger.Info("starting MeBox",
@@ -114,7 +123,7 @@ func (a *application) start() error {
 		a.logger.Warn("seed admin failed", zap.Error(err))
 	}
 
-	router := buildRouter(a.cfg, a.logger, a.embyCompatLogger, a.services)
+	router := buildRouter(a.cfg, a.logger, a.embyCompatLogger, a.userRequestLogger, a.services)
 	a.serverManager = newServerManager(a.cfg, a.logger, router)
 	a.services.ReloadHTTPServer = a.serverManager.Reload
 	if err := a.serverManager.Start(); err != nil {

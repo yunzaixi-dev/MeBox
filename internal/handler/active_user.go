@@ -10,8 +10,6 @@ import (
 	"github.com/truewhile/MeBox/internal/service"
 )
 
-const embyCtxUserName = "emby_user_name"
-
 func activeUserRequired(svc *service.Container) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		uid, _ := c.Get(middleware.CtxUserID)
@@ -33,6 +31,7 @@ func activeUserRequired(svc *service.Container) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 40101, "message": "user not found"})
 			return
 		}
+		c.Set(middleware.CtxUserName, u.Username)
 		if !u.IsActive {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": 40302, "message": "user account is disabled"})
 			return
@@ -66,6 +65,7 @@ func activeEmbyUserRequired(svc *service.Container) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"Code": 40101, "Message": "User not found"})
 			return
 		}
+		c.Set(middleware.CtxUserName, u.Username)
 		if !u.IsActive {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"Code": 40302, "Message": "User account is disabled"})
 			return
@@ -74,7 +74,6 @@ func activeEmbyUserRequired(svc *service.Container) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"Code": 40303, "Message": "User account has expired"})
 			return
 		}
-		c.Set(embyCtxUserName, u.Username)
 		c.Next()
 	}
 }

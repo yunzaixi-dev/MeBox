@@ -20,7 +20,7 @@ import (
 	"github.com/truewhile/MeBox/web"
 )
 
-func buildRouter(cfg *config.Config, logger *zap.Logger, embyCompatLogger *zap.Logger, svc *service.Container) *gin.Engine {
+func buildRouter(cfg *config.Config, logger *zap.Logger, embyCompatLogger *zap.Logger, userRequestLogger *zap.Logger, svc *service.Container) *gin.Engine {
 	if !cfg.App.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -28,6 +28,9 @@ func buildRouter(cfg *config.Config, logger *zap.Logger, embyCompatLogger *zap.L
 	traceEnabled, _ := strconv.ParseBool(os.Getenv("MEBOX_PERFORMANCE_TRACE"))
 	if traceEnabled {
 		r.Use(middleware.PerformanceTrace(embyCompatLogger))
+	}
+	if userRequestLogger != nil {
+		r.Use(middleware.DetailedRequests(userRequestLogger, svc.Repo.User))
 	}
 	r.Use(gin.Recovery())
 	if !traceEnabled {
