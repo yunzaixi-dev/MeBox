@@ -238,46 +238,49 @@ func embyAttachRequestTokenToMediaSources(c *gin.Context, out any) {
 	if token == "" || out == nil {
 		return
 	}
-	embyAttachTokenToMediaSourcesValue(out, token)
+	embyAttachTokenToMediaSourcesValue(out, token, c)
 }
 
-func embyAttachTokenToMediaSourcesValue(value any, token string) {
+func embyAttachTokenToMediaSourcesValue(value any, token string, c *gin.Context) {
 	switch typed := value.(type) {
 	case map[string]any:
-		embyAttachTokenToMediaSourcesMap(typed, token)
+		embyAttachTokenToMediaSourcesMap(typed, token, c)
 	case gin.H:
-		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token)
+		embyAttachTokenToMediaSourcesMap(map[string]any(typed), token, c)
 	case []map[string]any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesMap(item, token)
+			embyAttachTokenToMediaSourcesMap(item, token, c)
 		}
 	case []any:
 		for _, item := range typed {
-			embyAttachTokenToMediaSourcesValue(item, token)
+			embyAttachTokenToMediaSourcesValue(item, token, c)
 		}
 	}
 }
 
-func embyAttachTokenToMediaSourcesMap(out map[string]any, token string) {
+func embyAttachTokenToMediaSourcesMap(out map[string]any, token string, c *gin.Context) {
 	if out == nil {
 		return
 	}
 	if sources, ok := out["MediaSources"].([]map[string]any); ok {
-		embyAttachTokenToMediaSources(sources, token)
+		embyAttachTokenToMediaSources(sources, token, c)
 	} else if sources, ok := out["MediaSources"].([]any); ok {
 		for _, source := range sources {
 			if sourceMap, ok := source.(map[string]any); ok {
-				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token)
+				embyAttachTokenToMediaSources([]map[string]any{sourceMap}, token, c)
 			}
 		}
 	}
 	if items, ok := out["Items"]; ok {
-		embyAttachTokenToMediaSourcesValue(items, token)
+		embyAttachTokenToMediaSourcesValue(items, token, c)
 	}
 }
 
-func embyAttachTokenToMediaSources(sources []map[string]any, token string) {
+func embyAttachTokenToMediaSources(sources []map[string]any, token string, c *gin.Context) {
 	for _, source := range sources {
+		if raw, ok := source["Path"].(string); ok && source["IsRemote"] == true && source["Protocol"] == "Http" && strings.HasPrefix(raw, "/Videos/") {
+			source["Path"] = absoluteRequestURL(c, embyAppendAPIKey(raw, token))
+		}
 		for _, key := range []string{"DirectStreamUrl", "TranscodingUrl"} {
 			raw, ok := source[key].(string)
 			if !ok {

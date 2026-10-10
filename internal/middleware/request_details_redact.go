@@ -92,6 +92,15 @@ func sanitizeRequestBody(body []byte, contentType string) (any, string) {
 			return nil, "invalid_json"
 		}
 		return sanitizeRequestJSON(value, 0), "complete"
+	case mediaType == "text/plain":
+		value, valid := decodeRequestDetailJSON(body)
+		switch value.(type) {
+		case map[string]any, []any:
+			if valid {
+				return sanitizeRequestJSON(value, 0), "complete"
+			}
+		}
+		return nil, "unsupported"
 	case mediaType == "application/x-www-form-urlencoded":
 		values, err := url.ParseQuery(string(body))
 		if err != nil {

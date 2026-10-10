@@ -343,6 +343,9 @@ func TestDetailedRequestsBodyCompletionBoundaries(t *testing.T) {
 		{name: "known_length_without_eof", contentType: "application/vnd.emby+json", data: `{"Value":true}`, length: int64(len(`{"Value":true}`)), state: "complete"},
 		{name: "short_declared_length", contentType: "application/json", data: `{"Value":true}`, length: 100, err: io.EOF, state: "incomplete"},
 		{name: "form", contentType: "application/x-www-form-urlencoded", data: "ItemId=item-1&PlaySessionId=session-1&Password=form-secret", length: -1, err: io.EOF, state: "complete"},
+		{name: "text_json", contentType: "text/plain; charset=UTF-8", data: `{"PositionTicks":9007199254740993,"MediaSourceId":"item-1:mp4","PlaySessionId":"session-1","AccessToken":"text-secret"}`, length: -1, err: io.EOF, state: "complete"},
+		{name: "plain_text", contentType: "text/plain", data: "plain-secret", length: -1, err: io.EOF, state: "unsupported"},
+		{name: "plain_json_scalar", contentType: "text/plain", data: `"scalar-secret"`, length: -1, err: io.EOF, state: "unsupported"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			core, logs := observer.New(zap.InfoLevel)
@@ -370,6 +373,12 @@ func TestDetailedRequestsBodyCompletionBoundaries(t *testing.T) {
 				serialized, _ := json.Marshal(fields)
 				if form.Get("ItemId") != "item-1" || fields["session_id"] != "session-1" || bytes.Contains(serialized, []byte("form-secret")) {
 					t.Fatalf("form fields lost or credential exposed: %+v", fields)
+				}
+			}
+			if test.name == "text_json" {
+				body := fields["body"].(map[string]any)
+				if body["PositionTicks"] != json.Number("9007199254740993") || fields["requested_media_source_id"] != "item-1:mp4" || fields["session_id"] != "session-1" || body["AccessToken"] != "[REDACTED]" {
+					t.Fatalf("plain JSON playback fields lost or credential exposed: %+v", fields)
 				}
 			}
 		})

@@ -106,11 +106,11 @@
   `username_state=known/anonymous/unavailable` 区分已解析、匿名、数据库不可用／用户已不存在；不可用时保留真实 ID，不猜名字。
 - 保存原始／归一化路径、重复 query 值、脱敏请求头、客户端／设备／会话／profile、业务正文、状态、响应头／字节数、耗时与取消。
   `request_id` 对应服务端 `X-Request-ID`，开启性能追踪时与 trace 同 ID；Emby 大小写重分发不重复记录。
-  `requested_media_source_id` 是请求选项，不冒称实际选源；实际选源计数通过同 ID 的性能 trace 关联。
+  `requested_media_source_id` 是请求选项；trace 的 `playback.*.selected` 计数是协商首选建议，不等于客户端实际使用；实际来源须结合拉流路径与响应内容类型核对。
 - JSON 保留业务字段和标量类型、大整数精度，例如 `MinSegments="1"`、codec／声道／播放参数；form 同样按字段脱敏。
   密码／PIN／token／Cookie／Authorization／API key／签名密钥、签名 URL 凭据、敏感 `key/value` 设置及嵌套 JSON 字符串
   统一脱敏。认证头中的客户端信息另行解析保存；日志不是可直接复用认证凭据的原始网络抓包。
-- 仅被处理器读取的 JSON／form 正文采集，最多 1 MiB，不预读／额外 drain、不改变 handler 收到的字节／读错误。
+- 仅被处理器读取的 JSON／form 正文采集，最多 1 MiB，不预读／额外 drain、不改变 handler 收到的字节／读错误。`text/plain` 中完整可解析的 JSON 对象／数组也采集并同样脱敏；普通纯文本、JSON 标量或畸形正文不落原文。
   `body_state` 明确标记 `complete`、`empty`、`unread`、`incomplete`、`truncated`、`invalid_json` 或 `unsupported`；读错误另记 `body_read_error`。
   未读完、超限、畸形、压缩／二进制／multipart 正文不写原始片段，避免截断时漏出凭据。影片、字幕、图片等响应正文从不采集。
   流式请求在结束／取消时写完成记录，耗时不是客户端首帧或解码性能。
@@ -163,6 +163,7 @@ Emby 协议播放入口也读取 PlaybackInfo 的 `DeviceProfile`，或复用同
 明确支持相应 codec／fMP4 HLS 的客户端优先协商 2 秒 prepared VOD，使用标准 `TranscodingUrl`／HLS 字段，但不会启动现场转码；只有原生 MP4 能力或明确选择原音轨 MP4 时，使用原 ID 下的 faststart copy-only MP4。音频转换在来源名称明确标记。
 未知能力保留原文件默认，明确 source／其他音轨选择不暗换，声道数、码率、codec/profile/bit depth 与声明的必要条件不满足则不自动选优化来源。显式选择和自动默认的字幕都需要客户端支持现有外挂交付，不自动烧录；明确关闭字幕不阻止 prepared。
 `TranscodingProfile.MaxAudioChannels` 遵循 Emby schema 的字符串契约；非空上限必须为有效正整数且匹配实际音轨，否则不选 prepared。离线播放不消费 `MinSegments`，因此不为它建立强类型绑定：Hills 的 `"MinSegments":"1"` 不应阻断 PlaybackInfo，实际用于权限／选源的字段校验仍保留。
+prepared MP4／HLS 的 `Protocol=Http`、`IsRemote=true` 与 `Path` 指向同一个带鉴权的真实播放端点；不再把原 MKV 文件路径放进 MP4 来源。遵循 HTTP `Path` 的客户端可直接消费已协商资源，原版来源身份／路径和明确音轨选择不变。不会把 MP4 字节伪装成 MKV，也不在缺少设备身份的原版拉流请求上猜测账号内其他设备的能力。
 这些是协议协商保证，不代表所有硬件／解码器或 Hills 设备已经逐一实测改善。
 
 “原画”只保证视频不重编码：原视频经独立 copy-only MP4 规范化后，与 prepared 的逐包 SHA-256、数量、顺序一致；

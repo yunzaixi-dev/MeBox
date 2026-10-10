@@ -24,6 +24,7 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		url := embyDirectStreamURL(m.ID, "mp4") + "?MediaSourceId=" + m.ID + ":mp4"
 		src := e.baseMediaSource(ctx, m, "mp4", false, url, true)
 		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":mp4", MediaVersionLabel(*m)+" · 原画原音轨快速 MP4", url
+		src["Path"], src["IsRemote"] = url, true
 		src["SupportsProbing"] = false
 		if request.EnableDirectPlay != nil {
 			src["SupportsDirectPlay"] = *request.EnableDirectPlay
@@ -55,6 +56,7 @@ func (e *EmbyService) playbackMediaSources(ctx context.Context, m *model.Media, 
 		prepared.AudioCodec = metadata.AudioCodec
 		src := e.baseMediaSource(ctx, &prepared, "mp4", false, url, true)
 		src["Id"], src["Name"], src["DirectStreamUrl"] = m.ID+":hls", MediaVersionLabel(*m)+" · 原画分片 VOD", url
+		src["Path"], src["IsRemote"] = url, true
 		if metadata.AudioTranscoded {
 			src["Name"] = src["Name"].(string) + " · AAC 兼容音频"
 		}

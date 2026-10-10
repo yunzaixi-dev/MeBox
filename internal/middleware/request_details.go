@@ -66,7 +66,7 @@ func DetailedRequests(log *zap.Logger, users *repository.UserRepository) gin.Han
 			mediaType, _, err := mime.ParseMediaType(state.contentType)
 			encoding := strings.TrimSpace(c.GetHeader("Content-Encoding"))
 			supported := err == nil && (mediaType == "application/json" ||
-				strings.HasSuffix(mediaType, "+json") || mediaType == "application/x-www-form-urlencoded") &&
+				strings.HasSuffix(mediaType, "+json") || mediaType == "application/x-www-form-urlencoded" || mediaType == "text/plain") &&
 				(encoding == "" || strings.EqualFold(encoding, "identity"))
 			state.body = &detailedRequestBody{
 				ReadCloser: c.Request.Body,

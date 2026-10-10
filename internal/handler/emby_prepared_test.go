@@ -65,7 +65,7 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 				if len(result.MediaSources) != 2 || result.MediaSources[0]["Id"] != "media-1:mp4" || result.MediaSources[1]["Id"] != "media-1" {
 					t.Fatalf("optimized/default/original negotiation: %#v", result.MediaSources)
 				}
-				direct := result.MediaSources[0]["DirectStreamUrl"].(string)
+				direct := result.MediaSources[0]["Path"].(string)
 				uri, err := url.Parse(direct)
 				if err != nil {
 					t.Fatal(err)
@@ -73,7 +73,7 @@ func TestEmbyPreparedMP4NegotiatesAndStreamsThroughAllRouteShapes(t *testing.T) 
 				if uri.Query().Get("api_key") != token {
 					t.Fatal("external-player media lost authentication")
 				}
-				get := httptest.NewRequest(http.MethodGet, "/emby"+direct, nil)
+				get := httptest.NewRequest(http.MethodGet, direct, nil)
 				get.Header.Set("Range", "bytes=0-3")
 				body := httptest.NewRecorder()
 				router.ServeHTTP(body, get)
